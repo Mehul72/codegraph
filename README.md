@@ -28,8 +28,8 @@ src/query/tools.ts
 ## Install
 
 Node 22.13 or newer. Nothing to compile and no language toolchains to install:
-the parsers ship as WebAssembly, and the TypeScript build runs itself on
-install.
+the parsers ship as WebAssembly and the compiled JavaScript is committed, so
+installing is a download and nothing else.
 
 ```
 npm install -g github:Mehul72/codegraph

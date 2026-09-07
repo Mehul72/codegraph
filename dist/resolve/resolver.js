@@ -1,0 +1,588 @@
+import { familyOf } from '../extract/registry.js';
+import { buildDefinitionIndex, preferBest } from './definitions.js';
+import { isDefinitelyExternal, moduleCandidates, submoduleOf } from './modules.js';
+import { resolveImportAcrossRepos, resolveMemberAcrossRepos, resolveNameAcrossRepos, resolveQualifiedAcrossRepos, } from './crossrepo.js';
+/** Receivers that mean "the type I am currently inside of". */
+const SELF_RECEIVERS = new Set(['self', 'this', 'cls']);
+/**
+ * How many re-exports to walk through before giving up. Two barrels stacked
+ * on each other is normal; a chain longer than this is either generated code
+ * or a cycle, and neither is worth more lookups.
+ */
+const MAX_REEXPORT_HOPS = 4;
+/**
+ * Turn parked references into edges.
+ *
+ * This pass is where the tool earns its keep. Extraction is mechanical; the
+ * judgement lives here, in deciding when a name match counts as evidence and
+ * when it is a coin flip. The strategies below run strongest evidence first
+ * and the first hit wins.
+ *
+ * One invariant matters more than any single strategy: resolving a ref must
+ * depend only on the ref, its file's imports, and the current set of
+ * definitions. Nothing may depend on the order refs are processed in, because
+ * an incremental pass reprocesses a different subset than a cold index and the
+ * two have to agree.
+ */
+export function resolveRefs(input) {
+    const { store, config, facts, links, refs } = input;
+    if (refs.length === 0)
+        return { edges: 0, resolved: 0, unresolved: 0, externalNodes: 0 };
+    const index = buildDefinitionIndex(store, refs.length);
+    const imports = new ImportTable(store, refs.length);
+    const resolver = new Resolver(store, config, facts, links, index, imports);
+    // Inheritance before ordinary references, so that member lookups can walk up
+    // to a base class that was resolved in this same pass.
+    const ordered = [...refs].sort((a, b) => phase(a) - phase(b) || a.rid - b.rid);
+    for (const ref of ordered) {
+        resolver.place(ref);
+    }
+    return resolver.finish();
+}
+function phase(ref) {
+    if (ref.type === 'inherits' || ref.type === 'implements')
+        return 0;
+    return 1;
+}
+class Resolver {
+    store;
+    config;
+    facts;
+    links;
+    index;
+    imports;
+    edgeCount = 0;
+    resolvedRids = [];
+    unresolvedRids = [];
+    externalIds = new Set();
+    aliasCache = new Map();
+    importTargetCache = new Map();
+    importedFilesCache = new Map();
+    packageFilesCache = new Map();
+    /**
+     * Which linked repo each adopted stub came from. Members of a foreign
+     * module have to be looked up in that repo's index, since ours holds only
+     * the one symbol the import named.
+     */
+    foreignOwners = new Map();
+    constructor(store, config, facts, links, index, imports) {
+        this.store = store;
+        this.config = config;
+        this.facts = facts;
+        this.links = links;
+        this.index = index;
+        this.imports = imports;
+    }
+    place(ref) {
+        const targets = ref.targetKind === 'module' ? this.placeImport(ref) : this.placeName(ref);
+        for (const { node, confidence } of targets) {
+            if (node.id === ref.srcId)
+                continue; // recursion is not a useful edge
+            this.write({ srcId: ref.srcId, dstId: node.id, type: ref.type, confidence, path: ref.path, line: ref.line }, ref.rid);
+        }
+        // A ref counts as placed once we know what it means, even when that
+        // produced no edge. A recursive call is the case that matters: it resolves
+        // to its own definition every time, and calling that unresolved left it
+        // being reconsidered on every incremental pass and counted against the
+        // repo in status output for ever.
+        if (targets.length > 0)
+            this.resolvedRids.push(ref.rid);
+        else
+            this.unresolvedRids.push(ref.rid);
+    }
+    finish() {
+        if (this.resolvedRids.length > 0)
+            this.store.markRefsResolved(this.resolvedRids, true);
+        if (this.unresolvedRids.length > 0)
+            this.store.markRefsResolved(this.unresolvedRids, false);
+        return {
+            edges: this.edgeCount,
+            resolved: this.resolvedRids.length,
+            unresolved: this.unresolvedRids.length,
+            externalNodes: this.externalIds.size,
+        };
+    }
+    write(edge, rid) {
+        this.store.insertEdge(edge, rid);
+        this.edgeCount++;
+    }
+    // ------------------------------------------------------------- imports
+    placeImport(ref) {
+        const { target, via } = this.importResolution(ref);
+        // Third-party and standard library imports do not resolve, and that is
+        // the right answer rather than a failure, so nothing is logged.
+        if (!target)
+            return [];
+        // When a re-export was followed, both facts are worth an edge: the file
+        // really does depend on the barrel it named, and on the symbol it meant.
+        const placements = [{ node: target, confidence: 'resolved' }];
+        if (via && via.id !== target.id)
+            placements.push({ node: via, confidence: 'resolved' });
+        return placements;
+    }
+    /** Where one import statement actually points, cached per ref. */
+    importTarget(ref) {
+        return this.importResolution(ref).target;
+    }
+    importResolution(ref) {
+        const cached = this.importTargetCache.get(ref.rid);
+        if (cached !== undefined)
+            return cached;
+        let result = null;
+        let via = null;
+        const module = ref.module;
+        if (module) {
+            const family = familyOf(ref.lang);
+            const localFile = this.findImportTargetFile(family, module, ref.path);
+            if (localFile) {
+                result = this.pickImportedSymbol(localFile, ref.symbol);
+                if (result && result.path !== localFile)
+                    via = this.index.moduleNodeOf(localFile);
+            }
+            // `from pkg import models` reads as a symbol import but names a module.
+            // The tell is landing on the package itself: the symbol was not defined
+            // there, so check whether it is a module sitting underneath instead.
+            if (ref.symbol && (result === null || result.kind === 'module')) {
+                const nested = submoduleOf(family, module, ref.symbol);
+                const nestedFile = nested ? this.findImportTargetFile(family, nested, ref.path) : null;
+                if (nestedFile)
+                    result = this.index.moduleNodeOf(nestedFile) ?? result;
+            }
+            if (!result && this.links.length > 0) {
+                const hit = resolveImportAcrossRepos(this.links, family, module, ref.symbol);
+                if (hit)
+                    result = this.adoptExternal(hit.link, hit.node);
+            }
+        }
+        const resolution = { target: result, via };
+        this.importTargetCache.set(ref.rid, resolution);
+        return resolution;
+    }
+    findImportTargetFile(family, module, importerPath) {
+        if (isDefinitelyExternal(family, module))
+            return null;
+        for (const candidate of moduleCandidates(family, module, importerPath, this.facts)) {
+            const files = this.store.filesForModule(family, candidate);
+            const first = files.find((f) => f !== importerPath);
+            if (first)
+                return first;
+        }
+        return null;
+    }
+    /**
+     * Every file that answers to the same module string as `filePath`.
+     *
+     * In Go and Java a module key names a directory or a package, not a file, so
+     * an import lands on whichever file happened to sort first and the rest of
+     * the package became invisible: `store.Connect()` resolved and
+     * `store.FetchOrder()` did not, purely on filename order. Everywhere else a
+     * module is one file and this is that file on its own.
+     */
+    packageFiles(filePath, family) {
+        if (family !== 'go' && family !== 'java')
+            return [filePath];
+        const cacheKey = `${family}:${filePath}`;
+        let cached = this.packageFilesCache.get(cacheKey);
+        if (!cached) {
+            const module = this.store.moduleNameForPath(filePath);
+            const siblings = module ? this.store.filesForModule(family, module) : [];
+            // The named file first, so a name defined in several files of one
+            // package still prefers the one the import actually pointed at.
+            cached = [filePath, ...siblings.filter((f) => f !== filePath)];
+            this.packageFilesCache.set(cacheKey, cached);
+        }
+        return cached;
+    }
+    /**
+     * A named import points at one symbol, a whole-module import at the file.
+     * A named symbol missing from the file it was imported from was re-exported
+     * from somewhere else, so we follow that before giving up and falling back
+     * to the file.
+     */
+    pickImportedSymbol(filePath, symbol) {
+        if (symbol && symbol !== 'default') {
+            const best = this.exportedSymbol(filePath, symbol, 0, new Set());
+            if (best)
+                return best;
+        }
+        if (symbol === 'default') {
+            const inFile = this.index.inFile(filePath);
+            const best = preferBest(inFile.filter((n) => n.exported && n.kind !== 'module'));
+            if (best)
+                return best;
+        }
+        return this.index.moduleNodeOf(filePath);
+    }
+    /**
+     * The definition behind a name a file exports, following re-exports.
+     *
+     * `export * from './widget.js'` in an index file, and the `from .widget
+     * import make_widget` line in an `__init__.py`, are how most TypeScript and
+     * Python packages present their surface. Stopping at the file that was
+     * named put the edge on the barrel and still labelled it `resolved`, so
+     * every caller of the real symbol went missing while the answer claimed to
+     * be trustworthy. That is the one failure this tool must not have.
+     *
+     * Bounded by hop count and by a visited set, because barrels are circular
+     * often enough that neither guard is optional.
+     */
+    exportedSymbol(filePath, symbol, depth, seen) {
+        const here = preferBest(this.index.inFile(filePath).filter((n) => n.name === symbol && n.kind !== 'module'));
+        if (here)
+            return here;
+        if (depth >= MAX_REEXPORT_HOPS || seen.has(filePath))
+            return null;
+        seen.add(filePath);
+        for (const imp of this.imports.forFile(filePath)) {
+            if (!imp.module)
+                continue;
+            // What to ask the next file for. A re-export either names the symbol,
+            // possibly renaming it on the way through, or sweeps up everything with
+            // a star. Anything else binds the name locally and is not re-exported.
+            let wanted = null;
+            if (imp.alias === symbol && imp.symbol)
+                wanted = imp.symbol;
+            else if (imp.symbol === null && imp.alias === null)
+                wanted = symbol;
+            if (wanted === null)
+                continue;
+            const next = this.findImportTargetFile(familyOf(imp.lang), imp.module, filePath);
+            if (!next)
+                continue;
+            const hit = this.exportedSymbol(next, wanted, depth + 1, seen);
+            if (hit)
+                return hit;
+        }
+        return null;
+    }
+    /** What a local binding introduced by an import refers to. */
+    aliasTarget(filePath, alias) {
+        let perFile = this.aliasCache.get(filePath);
+        if (!perFile) {
+            perFile = new Map();
+            this.aliasCache.set(filePath, perFile);
+        }
+        const cached = perFile.get(alias);
+        if (cached !== undefined)
+            return cached;
+        let found = null;
+        for (const imp of this.imports.forFile(filePath)) {
+            if (imp.alias !== alias)
+                continue;
+            found = this.importTarget(imp);
+            if (found)
+                break;
+        }
+        perFile.set(alias, found);
+        return found;
+    }
+    /**
+     * Is `candidate` something the referring file could actually reach? Being
+     * in the same file counts, being imported counts, and in Go so does being
+     * in the same directory, because that is one package with one scope.
+     */
+    isVisibleFrom(ref, candidate) {
+        if (candidate.path === ref.path)
+            return true;
+        if (this.importedFiles(ref.path).has(candidate.path))
+            return true;
+        return familyOf(ref.lang) === 'go' && dirOf(candidate.path) === dirOf(ref.path);
+    }
+    /** Every file this file pulls something in from. */
+    importedFiles(filePath) {
+        let cached = this.importedFilesCache.get(filePath);
+        if (!cached) {
+            cached = new Set();
+            for (const imp of this.imports.forFile(filePath)) {
+                // Both ends of a re-export count as imported: the barrel is what the
+                // source names, and the file behind it is where the symbol lives.
+                const { target, via } = this.importResolution(imp);
+                if (target)
+                    cached.add(target.path);
+                if (via)
+                    cached.add(via.path);
+            }
+            this.importedFilesCache.set(filePath, cached);
+        }
+        return cached;
+    }
+    /**
+     * Star imports bring names in without a binding we can see, so we check the
+     * files they pull from directly. Python's `from .models import *` is the
+     * common case and it is worth handling.
+     */
+    wildcardTarget(filePath, name) {
+        for (const imp of this.imports.forFile(filePath)) {
+            if (imp.symbol !== null || imp.alias !== null)
+                continue;
+            const target = this.importTarget(imp);
+            if (!target || target.kind !== 'module')
+                continue;
+            const best = preferBest(this.index.inFile(target.path).filter((n) => n.name === name && n.kind !== 'module'));
+            if (best)
+                return best;
+        }
+        return null;
+    }
+    // --------------------------------------------------------------- names
+    placeName(ref) {
+        const name = ref.name;
+        if (!name)
+            return [];
+        if (ref.type === 'queries')
+            return this.placeTable(name);
+        const qualifier = ref.qualifier?.trim() || null;
+        const selfish = qualifier !== null && SELF_RECEIVERS.has(qualifier);
+        const sameFile = this.index.inFile(ref.path);
+        // 1. self.foo() and this.foo(), which we can pin down properly.
+        if (selfish) {
+            const own = this.resolveOnEnclosingType(ref, name);
+            if (own)
+                return [{ node: own, confidence: 'resolved' }];
+        }
+        // 2. A definition in the same file, which the parser saw whole.
+        if (qualifier === null || selfish) {
+            const local = sameFile.filter((n) => n.name === name && n.kind !== 'module');
+            if (local.length === 1)
+                return [{ node: local[0], confidence: 'exact' }];
+            const best = preferBest(local);
+            if (best)
+                return [{ node: best, confidence: 'resolved' }];
+        }
+        // 3. The bare name was imported: `from x import helper; helper()`.
+        if (qualifier === null) {
+            const imported = this.aliasTarget(ref.path, name);
+            if (imported)
+                return [{ node: imported, confidence: 'resolved' }];
+            const starred = this.wildcardTarget(ref.path, name);
+            if (starred)
+                return [{ node: starred, confidence: 'resolved' }];
+        }
+        // 4. The receiver was imported: `import store; store.save()` or
+        //    `from x import Order; Order.create()`.
+        if (qualifier !== null && !selfish) {
+            const head = qualifier.includes('.') ? qualifier.split('.')[0] : qualifier;
+            const holder = this.aliasTarget(ref.path, head) ?? this.aliasTarget(ref.path, qualifier);
+            if (holder) {
+                const member = this.resolveMemberOf(holder, name, familyOf(ref.lang));
+                if (member)
+                    return [{ node: member, confidence: 'resolved' }];
+            }
+            // 5. Or it names a type declared right here: `Order.create()`.
+            const localType = sameFile.find((n) => n.name === head && isTypeKind(n));
+            if (localType) {
+                const member = this.resolveMemberOf(localType, name, familyOf(ref.lang));
+                if (member)
+                    return [{ node: member, confidence: 'resolved' }];
+            }
+        }
+        const global = this.index
+            .byName(name)
+            .filter((n) => n.kind !== 'module' && n.id !== ref.srcId && callShapeFits(n, qualifier, ref.type));
+        // 6. The receiver is an object we cannot type, but the name is defined in
+        //    exactly one file this file can see. An import is real evidence, and
+        //    in Go so is sharing a package, since a package has one flat scope
+        //    across its files and never imports itself. This is where
+        //    `self.repository.find()` and `service.create()` get linked properly
+        //    instead of being written off as name matches.
+        const visible = global.filter((n) => this.isVisibleFrom(ref, n));
+        if (visible.length === 1)
+            return [{ node: visible[0], confidence: 'resolved' }];
+        // 7. A qualified call with nothing visible behind it is where we stop.
+        //    `rows.push(x)` matches every method called push in the repo and
+        //    means none of them, so guessing here would fill the highest-value
+        //    output with edges that are simply wrong.
+        if (qualifier !== null && !selfish) {
+            return visible.length > 1 && visible.length <= this.config.maxHeuristicCandidates
+                ? visible.map((node) => ({ node, confidence: 'heuristic' }))
+                : [];
+        }
+        // 8. A bare name that exists somewhere. Weak, but a bare call really is
+        //    usually the thing of that name, so it is worth offering with the tag
+        //    that says so. Past a handful of candidates it stops being worth it.
+        if (global.length > 0 && global.length <= this.config.maxHeuristicCandidates) {
+            return global.map((node) => ({ node, confidence: 'heuristic' }));
+        }
+        if (global.length > this.config.maxHeuristicCandidates) {
+            // A dozen guesses for a name like `get` is noise, not information, and
+            // confidently wrong answers are worse than no answer.
+            return [];
+        }
+        if (this.links.length > 0) {
+            const hit = resolveNameAcrossRepos(this.links, name);
+            if (hit)
+                return [{ node: this.adoptExternal(hit.link, hit.node), confidence: 'heuristic' }];
+        }
+        return [];
+    }
+    /** Look up `name` as a member of the type the reference sits inside. */
+    resolveOnEnclosingType(ref, name) {
+        const owner = this.index.byId(ref.srcId);
+        if (!owner?.qualified)
+            return null;
+        const parts = owner.qualified.split('.');
+        if (parts.length < 2)
+            return null;
+        const typeQualified = parts.slice(0, -1).join('.');
+        const sameFile = this.index.inFile(ref.path);
+        const direct = sameFile.find((n) => n.qualified === `${typeQualified}.${name}`);
+        if (direct)
+            return direct;
+        const typeNode = sameFile.find((n) => n.qualified === typeQualified && isTypeKind(n));
+        return typeNode ? this.resolveInherited(typeNode, name, 0) : null;
+    }
+    /** A member on a named type or module, following base types one level up. */
+    resolveMemberOf(holder, name, family) {
+        // A holder from a linked repo lives in a file our index knows nothing
+        // about, so ask the repo that owns it.
+        const owner = this.foreignOwners.get(holder.id);
+        if (owner)
+            return this.resolveForeignMemberOf(owner, holder, name);
+        if (holder.kind === 'module') {
+            const candidates = [];
+            for (const file of this.packageFiles(holder.path, family)) {
+                candidates.push(...this.index.inFile(file).filter((n) => n.name === name && n.kind !== 'module'));
+            }
+            return preferBest(candidates);
+        }
+        if (!isTypeKind(holder) || !holder.qualified)
+            return null;
+        const direct = this.index.inFile(holder.path).find((n) => n.qualified === `${holder.qualified}.${name}`);
+        if (direct)
+            return direct;
+        return this.resolveInherited(holder, name, 0);
+    }
+    resolveForeignMemberOf(owner, holder, name) {
+        const hit = holder.kind === 'module'
+            ? resolveMemberAcrossRepos(owner, holder.path, name)
+            : holder.qualified
+                ? resolveQualifiedAcrossRepos(owner, holder.path, `${holder.qualified}.${name}`)
+                : null;
+        return hit ? this.adoptExternal(hit.link, hit.node) : null;
+    }
+    /**
+     * Walk up inherits and implements edges looking for a member. Capped at two
+     * levels: past that the answer is a guess dressed up as a fact.
+     */
+    resolveInherited(typeNode, name, depth) {
+        if (depth >= 2)
+            return null;
+        const bases = this.store.outgoing([typeNode.id]).filter((e) => e.type === 'inherits' || e.type === 'implements');
+        for (const base of bases) {
+            const baseNode = this.index.byId(base.dstId);
+            if (!baseNode?.qualified)
+                continue;
+            const member = this.index.inFile(baseNode.path).find((n) => n.qualified === `${baseNode.qualified}.${name}`);
+            if (member)
+                return member;
+            const deeper = this.resolveInherited(baseNode, name, depth + 1);
+            if (deeper)
+                return deeper;
+        }
+        return null;
+    }
+    /** Table names come out of embedded SQL, so only table nodes can match. */
+    placeTable(name) {
+        const tables = this.index.byName(name).filter((n) => n.kind === 'table');
+        if (tables.length === 1)
+            return [{ node: tables[0], confidence: 'resolved' }];
+        if (tables.length > 1 && tables.length <= this.config.maxHeuristicCandidates) {
+            return tables.map((node) => ({ node, confidence: 'heuristic' }));
+        }
+        return [];
+    }
+    /**
+     * Copy a linked repo's node in as a stub, so traversal, ranking and output
+     * all work without reopening the other database. The stub keeps the owning
+     * repo name, which is what the output labels.
+     */
+    adoptExternal(link, node) {
+        if (!this.externalIds.has(node.id)) {
+            // Never write over a node this repo defines itself. insertNode upserts
+            // on the id, and external = 1 would hide our own symbol from every
+            // count and listing. Colliding ids mean two repos sharing a name, which
+            // is worth resolving against in memory but never worth persisting.
+            if (!this.store.hasLocalNode(node.id)) {
+                this.store.insertNode({ ...node, repo: link.name }, true);
+                this.externalIds.add(node.id);
+            }
+        }
+        this.foreignOwners.set(node.id, link);
+        return {
+            id: node.id,
+            name: node.name,
+            path: node.path,
+            kind: node.kind,
+            qualified: node.qualified,
+            exported: node.exported,
+        };
+    }
+}
+function isTypeKind(node) {
+    return node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface';
+}
+function dirOf(filePath) {
+    const cut = filePath.lastIndexOf('/');
+    return cut === -1 ? '' : filePath.slice(0, cut);
+}
+/**
+ * Could a reference written this way plausibly mean this symbol?
+ *
+ * By the time we reach the name-match strategies there is no import or type
+ * to lean on, so the only thing left is the shape of the call. Two rules do
+ * most of the work, and both are about refusing to answer:
+ *
+ *   `rows.push(x)` is never a free function called push. Without this, one
+ *   small private helper collects an edge from every array append in the
+ *   repo, which makes it the most depended on symbol in the graph and buries
+ *   the real ones.
+ *
+ *   `add(x)` is never a method on some unrelated class, because no language
+ *   here lets you call a method without a receiver from outside its body,
+ *   and inside its body the earlier strategies already matched it.
+ *
+ * Plain references are left alone: a bare type name in a signature or an
+ * annotation is a normal way to mention a method or a function.
+ */
+function callShapeFits(node, qualifier, type) {
+    if (type !== 'calls')
+        return true;
+    if (qualifier === null)
+        return node.kind !== 'method';
+    if (SELF_RECEIVERS.has(qualifier))
+        return true;
+    return node.kind !== 'function';
+}
+/**
+ * The import statements of each file, which the name strategies consult. Bulk
+ * loaded for a cold index, queried per file for a warm one.
+ */
+class ImportTable {
+    store;
+    cache = new Map();
+    bulk = null;
+    constructor(store, refCount) {
+        this.store = store;
+        if (refCount <= 4000)
+            return;
+        this.bulk = new Map();
+        for (const ref of store.allImportRefs()) {
+            const list = this.bulk.get(ref.path);
+            if (list)
+                list.push(ref);
+            else
+                this.bulk.set(ref.path, [ref]);
+        }
+    }
+    forFile(filePath) {
+        if (this.bulk)
+            return this.bulk.get(filePath) ?? [];
+        let cached = this.cache.get(filePath);
+        if (!cached) {
+            cached = this.store.importRefsInFile(filePath);
+            this.cache.set(filePath, cached);
+        }
+        return cached;
+    }
+}
+//# sourceMappingURL=resolver.js.map

@@ -36,7 +36,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "prepare": "npm run build",
+    "prepare": "node scripts/prepare.mjs",
     "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "grammars": "node scripts/fetch-grammars.mjs",
     "test": "node --no-warnings --import tsx --test test/*.test.ts",

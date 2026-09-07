@@ -1,0 +1,43 @@
+/**
+ * Node version gate plus warning cleanup. node:sqlite is still flagged
+ * experimental, and its warning would otherwise show up in the middle of
+ * every command's output.
+ *
+ * 22.13 rather than 22.5, which is when node:sqlite stopped needing
+ * --experimental-sqlite. Supporting the window below it meant passing that
+ * flag, and a flag is not a thing a released Node either has or ignores: a
+ * runtime that has dropped it refuses to start at all.
+ */
+const MIN_MAJOR = 22;
+const MIN_MINOR = 13;
+export function requiredNodeVersion() {
+    return `${MIN_MAJOR}.${MIN_MINOR}.0`;
+}
+export function checkNodeVersion() {
+    const [majorStr = '0', minorStr = '0'] = process.versions.node.split('.');
+    const major = Number(majorStr);
+    const minor = Number(minorStr);
+    const tooOld = major < MIN_MAJOR || (major === MIN_MAJOR && minor < MIN_MINOR);
+    if (!tooOld)
+        return;
+    process.stderr.write([
+        `codegraph needs Node ${requiredNodeVersion()} or newer, this is Node ${process.versions.node}.`,
+        '',
+        'It uses the built-in node:sqlite module, which older releases do not have.',
+        'Upgrade Node (nvm install 22, or https://nodejs.org) and try again.',
+        '',
+    ].join('\n'));
+    process.exit(1);
+}
+export function silenceExperimentalWarnings() {
+    const original = process.emitWarning.bind(process);
+    // The signature is overloaded, so keep it loose and hand the rest straight back.
+    process.emitWarning = ((warning, ...rest) => {
+        const text = typeof warning === 'string' ? warning : String(warning?.message ?? '');
+        const type = typeof rest[0] === 'string' ? rest[0] : rest[0]?.type;
+        if (type === 'ExperimentalWarning' && /SQLite|sqlite/.test(text))
+            return;
+        original(warning, ...rest);
+    });
+}
+//# sourceMappingURL=runtime.js.map
