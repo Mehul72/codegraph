@@ -27,7 +27,7 @@ src/query/tools.ts
 
 ## Install
 
-Node 22.5 or newer. Nothing to compile and no language toolchains to install:
+Node 22.13 or newer. Nothing to compile and no language toolchains to install:
 the parsers ship as WebAssembly, and the TypeScript build runs itself on
 install.
 
@@ -149,10 +149,11 @@ Python, Go, TypeScript, TSX, JavaScript, Java, and SQL DDL.
 
 Each has real import resolution, not just name matching: Python module paths
 and relative imports, Go package paths from `go.mod` plus package scope across
-files, TypeScript path aliases from `tsconfig.json` including barrel files,
-Java packages and imports. SQL gets tables, columns, foreign keys and views,
-and strings that look like SQL in the other languages become `queries` edges
-onto those tables.
+files, TypeScript path aliases from `tsconfig.json`, Java packages and imports.
+Re-exports are followed, so a call through a barrel `index.ts` or a package
+`__init__.py` lands on the definition behind it rather than on the file in the
+middle. SQL gets tables, columns, foreign keys and views, and strings that look
+like SQL in the other languages become `queries` edges onto those tables.
 
 ## Staying current
 

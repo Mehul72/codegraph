@@ -33,6 +33,9 @@ export interface IndexOptions {
 /** How many files we read ahead before parsing, and per write transaction. */
 const BATCH_SIZE = 128;
 
+/** How many parse failures we quote back. The count is reported in full. */
+const WARNING_SAMPLE = 20;
+
 export async function runIndex(options: IndexOptions): Promise<IndexStats> {
   const started = Date.now();
   const { repoRoot, config, store } = options;
@@ -63,7 +66,6 @@ export async function runIndex(options: IndexOptions): Promise<IndexStats> {
     });
 
     let indexed = 0;
-    let skipped = plan.skipped;
 
     for (let offset = 0; offset < plan.changed.length; offset += BATCH_SIZE) {
       const batch = plan.changed.slice(offset, offset + BATCH_SIZE);
@@ -71,7 +73,7 @@ export async function runIndex(options: IndexOptions): Promise<IndexStats> {
 
       // Parsing is wasm and single threaded, so it happens outside the write
       // transaction; the transaction only wraps the inserts.
-      const parsed: Array<{ file: WalkedFile; record: FileRecord; extractor: Extractor | null; result: ParsedResult }> = [];
+      const parsed: ParsedFile[] = [];
 
       for (const entry of loaded) {
         if (!entry) continue;
@@ -81,26 +83,36 @@ export async function runIndex(options: IndexOptions): Promise<IndexStats> {
           hash,
           size: file.size,
           mtimeMs: file.mtimeMs,
-          lang: extractor?.id ?? null,
+          lang: extractor.id,
           indexedAt: Date.now(),
         };
 
-        if (!extractor) {
-          parsed.push({ file, record, extractor: null, result: EMPTY_PARSE });
-          skipped++;
+        // The file changed size or mtime but not a byte of content, which is
+        // what a branch switch, a rebase and most formatters leave behind.
+        // Its symbols are already correct, so only the stat is worth writing:
+        // recording the new mtime is what lets the next pass skip it outright.
+        if (!options.force && cached.get(file.relPath)?.hash === hash) {
+          parsed.push({ file, record, extractor, result: EMPTY_PARSE, reused: true });
           continue;
         }
 
         const result = await parseAndExtract(pool, extractor, file.relPath, source, config.repo);
         if (result.warning) warnings.push(result.warning);
-        parsed.push({ file, record, extractor, result });
+        parsed.push({ file, record, extractor, result, reused: false });
         indexed++;
+        // Files actually parsed, not the offset plus however many entries this
+        // batch has collected so far: that counted reused and skipped files as
+        // progress and reset at every batch boundary.
         const total = plan.changed.length;
-        progress?.update(`${formatCount(offset + parsed.length)}/${formatCount(total)} ${plural(total, 'file')}`);
+        progress?.update(`${formatCount(indexed)}/${formatCount(total)} ${plural(total, 'file')}`);
       }
 
       store.transaction(() => {
         for (const item of parsed) {
+          if (item.reused) {
+            store.upsertFile(item.record);
+            continue;
+          }
           store.clearFileContents(item.file.relPath);
           store.upsertFile(item.record);
           writeExtraction(store, item.extractor, item.file.relPath, item.result, dirtyNames);
@@ -110,15 +122,17 @@ export async function runIndex(options: IndexOptions): Promise<IndexStats> {
 
     progress?.finish(`${formatCount(indexed)} ${plural(indexed, 'file')} parsed`);
 
+    // Nothing reparsed and nothing removed means no reference moved, so the
+    // resolution pass has nothing to reconsider.
+    const touchedGraph = indexed > 0 || plan.deleted.length > 0;
     const facts = repoFacts(repoRoot);
-    const outcome =
-      plan.changed.length > 0 || plan.deleted.length > 0
-        ? store.transaction(() =>
-            resolveRefs({ store, config, facts, links, refs: collectRefsToResolve(store, plan, dirtyNames) }),
-          )
-        : { edges: 0, resolved: 0, unresolved: 0, externalNodes: 0 };
+    const outcome = touchedGraph
+      ? store.transaction(() =>
+          resolveRefs({ store, config, facts, links, refs: collectRefsToResolve(store, plan, dirtyNames) }),
+        )
+      : { edges: 0, resolved: 0, unresolved: 0, externalNodes: 0 };
 
-    if (plan.deleted.length > 0 || plan.changed.length > 0) {
+    if (touchedGraph) {
       store.transaction(() => store.deleteOrphanExternalNodes());
     }
 
@@ -130,12 +144,16 @@ export async function runIndex(options: IndexOptions): Promise<IndexStats> {
       filesScanned: walked.length,
       filesIndexed: indexed,
       filesRemoved: plan.deleted.length,
-      filesSkipped: skipped,
+      filesSkipped: plan.skipped,
       nodes: store.nodeCount(),
       edges: store.edgeCount(),
       unresolvedRefs: store.unresolvedRefCount(),
       durationMs: Date.now() - started,
-      warnings: warnings.slice(0, 20),
+      // Capped for display, but the count travels separately: reporting the
+      // length of the capped list told a repo with 500 unparseable files
+      // that exactly 20 were skipped.
+      warnings: warnings.slice(0, WARNING_SAMPLE),
+      warningCount: warnings.length,
     };
   } finally {
     if (ownPool) pool.dispose();
@@ -159,10 +177,10 @@ interface WorkPlan {
 }
 
 /**
- * Decide what actually needs parsing. Matching size and mtime is treated as
- * unchanged without reading the file, which is what makes a warm pass cheap;
- * anything else gets read and hashed, and an unchanged hash still saves the
- * parse.
+ * Decide what needs looking at. Matching size and mtime is treated as
+ * unchanged without reading the file, which is what makes a warm pass cheap.
+ * Anything else is read and hashed, and runIndex still skips the parse when
+ * that hash turns out to match.
  */
 function planWork(
   walked: readonly WalkedFile[],
@@ -175,8 +193,13 @@ function planWork(
   let skipped = 0;
 
   for (const file of walked) {
-    seen.add(file.relPath);
-
+    // Deliberately not marked seen yet. A file we walk but will not parse has
+    // to look the same to staleFiles as one that is gone: if a previous pass
+    // did index it, the symbols it contributed are now wrong and have to be
+    // dropped. A file that grows past maxFileBytes, or whose language is
+    // taken out of config.languages, otherwise kept its old symbols in the
+    // graph for ever, reported at lines that no longer hold them. Files that
+    // were never indexed have no row in `files`, so they cannot be affected.
     if (file.size > config.maxFileBytes) {
       skipped++;
       continue;
@@ -190,6 +213,7 @@ function planWork(
       skipped++;
       continue;
     }
+    seen.add(file.relPath);
 
     const previous = cached.get(file.relPath);
     if (!options.force && previous && previous.size === file.size && Math.round(previous.mtimeMs) === Math.round(file.mtimeMs)) {
@@ -198,26 +222,64 @@ function planWork(
     changed.push(file);
   }
 
-  // A scoped run must not delete rows for files it never looked at.
-  const deleted = options.only && options.only.length > 0 ? [] : [...cached.keys()].filter((p) => !seen.has(p));
-
+  const deleted = staleFiles(cached, seen, options.only);
   return { changed, deleted, skipped };
+}
+
+/**
+ * Indexed files that are no longer on disk.
+ *
+ * A scoped run must not drop rows for files it never looked at, but it does
+ * own everything under the paths it was given. That second half matters: the
+ * edit hooks call `touch` with the file the agent just deleted, and without
+ * this the symbols of a deleted file stay in the graph until the next full
+ * pass happens to notice.
+ */
+function staleFiles(
+  cached: Map<string, FileRecord>,
+  seen: ReadonlySet<string>,
+  only: readonly string[] | undefined,
+): string[] {
+  const stale = [...cached.keys()].filter((p) => !seen.has(p));
+  if (!only || only.length === 0) return stale;
+
+  // An empty scope is the repo root, which means the whole tree.
+  const scopes = only.filter((s) => s !== '');
+  if (scopes.length < only.length) return stale;
+
+  return stale.filter((p) => scopes.some((scope) => p === scope || p.startsWith(`${scope}/`)));
 }
 
 interface LoadedFile {
   file: WalkedFile;
   source: string;
   hash: string;
-  extractor: Extractor | null;
+  extractor: Extractor;
 }
 
+/** One file plus what came of it, or what we chose not to redo. */
+interface ParsedFile {
+  file: WalkedFile;
+  record: FileRecord;
+  extractor: Extractor;
+  result: ParsedResult;
+  /** Content-identical to what is already indexed, so nothing was parsed. */
+  reused: boolean;
+}
+
+/**
+ * planWork only ever schedules files it has already matched to an enabled
+ * extractor, so anything without one here is a file that changed language
+ * under us, and skipping it is the same as never having seen it.
+ */
 async function loadOne(file: WalkedFile, config: CodegraphConfig): Promise<LoadedFile | null> {
   try {
     const content = await readSource(file.absPath);
     if (!content) return null; // binary, nothing to extract
     const extractor = extractorFor(file.relPath);
-    const wanted = extractor && (config.languages.length === 0 || config.languages.includes(extractor.id));
-    return { file, source: content.text, hash: content.hash, extractor: wanted ? extractor : null };
+    if (!extractor) return null;
+    if (config.languages.length > 0 && !config.languages.includes(extractor.id)) return null;
+    return { file, source: content.text, hash: content.hash, extractor };
   } catch (err) {
     log.debug(`could not read ${file.relPath}: ${(err as Error).message}`);
     return null;

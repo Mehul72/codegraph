@@ -40,7 +40,7 @@ export async function statusCommand(): Promise<void> {
     } else {
       const rows = agents.map((agent) => `${agent.label}${wiredMarker(session.repoRoot, agent.id)}`);
       out(`agents    ${rows.join(', ')}`);
-      out('          (wired) means an mcp entry for codegraph is present');
+      out('          (wired) means the config file codegraph writes for that agent exists');
     }
   } finally {
     session.close();

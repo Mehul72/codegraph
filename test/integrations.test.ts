@@ -202,3 +202,80 @@ test('every integration has a distinct lowercase id and a readable label', () =>
     assert.ok(integration.label.length > 0);
   }
 });
+
+/**
+ * The hook runs the CLI, not the MCP server, so it needs the whole launcher
+ * minus the `mcp` subcommand. Taking only `server.command` produced
+ * `npx touch ...`, and `touch` is a real and unrelated package on the npm
+ * registry: reindex-on-edit silently fetched and ran that instead, for
+ * everyone who had not installed codegraph globally.
+ */
+test('the Claude edit hook runs codegraph even when it is only reachable through npx', async () => {
+  const root = await makeRepo('hooked', { 'a.py': 'def a():\n    return 1\n' });
+  const claude = integrationById('claude');
+  assert.ok(claude);
+
+  await claude.install({ repoRoot: root, server: { command: 'npx', args: ['-y', 'codegraph', 'mcp'] } });
+  const settings = JSON.parse(
+    await fsp.readFile(path.join(root, '.claude', 'settings.json'), 'utf8'),
+  ) as { hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> } };
+
+  const command = settings.hooks.PostToolUse[0]?.hooks[0]?.command ?? '';
+  assert.match(command, /^npx -y codegraph touch /, `the hook ran the wrong program: ${command}`);
+  assert.doesNotMatch(command, /^npx touch/, 'npx touch installs an unrelated package');
+  assert.ok(!command.includes(' mcp '), 'the hook must not carry the mcp subcommand');
+});
+
+test('the Claude edit hook stays a bare command when codegraph is on PATH', async () => {
+  const root = await makeRepo('hooked-path', { 'a.py': 'def a():\n    return 1\n' });
+  const claude = integrationById('claude');
+  assert.ok(claude);
+
+  await claude.install({ repoRoot: root, server: { command: 'codegraph', args: ['mcp'] } });
+  const settings = JSON.parse(
+    await fsp.readFile(path.join(root, '.claude', 'settings.json'), 'utf8'),
+  ) as { hooks: { PostToolUse: Array<{ hooks: Array<{ command: string }> }> } };
+
+  assert.match(settings.hooks.PostToolUse[0]?.hooks[0]?.command ?? '', /^codegraph touch /);
+});
+
+/**
+ * Both halves of the git hook writer used to splice with the result of
+ * indexOf without checking it for -1, so a start marker whose end marker had
+ * been deleted made them cut sixteen arbitrary characters out of a script the
+ * user wrote. Leaving an unparseable block alone is the only safe answer.
+ */
+test('git hooks never rewrite a hook script whose end marker is missing', async () => {
+  const { installGitHooks, uninstallGitHooks } = await import('../src/integrations/githooks.js');
+  const damaged = '#!/bin/sh\necho "important"\n# codegraph:start\ncodegraph index &\n';
+  const hookAt = (root: string) => path.join(root, '.git', 'hooks', 'post-commit');
+
+  for (const run of [installGitHooks, uninstallGitHooks]) {
+    const root = await makeRepo('git-hooks', { 'a.py': 'def a():\n    return 1\n' });
+    await fsp.mkdir(path.join(root, '.git', 'hooks'), { recursive: true });
+    await fsp.writeFile(hookAt(root), damaged, 'utf8');
+
+    await run(root, 'codegraph');
+    const after = await fsp.readFile(hookAt(root), 'utf8');
+    assert.ok(after.includes('#!/bin/sh\necho "important"\n'), `${run.name} mangled the user's script`);
+  }
+});
+
+test('git hooks install, re-install and uninstall without disturbing the rest of the script', async () => {
+  const { installGitHooks, uninstallGitHooks } = await import('../src/integrations/githooks.js');
+  const root = await makeRepo('git-hooks-clean', { 'a.py': 'def a():\n    return 1\n' });
+  await fsp.mkdir(path.join(root, '.git', 'hooks'), { recursive: true });
+  const hook = path.join(root, '.git', 'hooks', 'post-commit');
+  const original = '#!/bin/sh\necho "mine"\n';
+  await fsp.writeFile(hook, original, 'utf8');
+
+  const first = await installGitHooks(root, 'npx -y codegraph');
+  assert.ok(first.changed.length > 0);
+  assert.match(await fsp.readFile(hook, 'utf8'), /npx -y codegraph index/);
+
+  const again = await installGitHooks(root, 'npx -y codegraph');
+  assert.equal(again.changed.length, 0, 'installing twice must be a no-op');
+
+  await uninstallGitHooks(root);
+  assert.equal(await fsp.readFile(hook, 'utf8'), original, 'uninstall must restore the file exactly');
+});

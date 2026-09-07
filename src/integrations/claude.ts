@@ -4,7 +4,7 @@ import { pathExists } from '../util/fs.js';
 import { objectAt, peekObject, pruneEmpty, updateJsonFile } from './jsonfile.js';
 import { stripMarkedFile, writeMarkedFile } from './markers.js';
 import { claudeInstructions } from './instructions.js';
-import { emptyReport, type Integration, type IntegrationReport, type InstallContext } from './types.js';
+import { cliInvocation, emptyReport, type Integration, type IntegrationReport, type InstallContext } from './types.js';
 
 const HOOK_MATCHER = 'Edit|Write|MultiEdit';
 
@@ -47,7 +47,7 @@ export const claudeIntegration: Integration = {
     // Reindexing after an edit is an optimisation, never a blocker, so the
     // hook is fire and forget: it backgrounds itself and always exits 0.
     const settingsFile = path.join(repoRoot, '.claude', 'settings.json');
-    const hookCommand = `${quote(server.command)} touch "$CLAUDE_FILE_PATHS" >/dev/null 2>&1 &`;
+    const hookCommand = `${cliInvocation(server)} touch "$CLAUDE_FILE_PATHS" >/dev/null 2>&1 &`;
 
     if (
       await updateJsonFile(settingsFile, (root) => {
@@ -113,8 +113,4 @@ function isOurHook(entry: unknown): boolean {
     const command = (hook as { command?: unknown }).command;
     return typeof command === 'string' && command.includes('codegraph') && command.includes('touch');
   });
-}
-
-function quote(command: string): string {
-  return /[\s"']/.test(command) ? `"${command}"` : command;
 }

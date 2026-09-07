@@ -312,3 +312,126 @@ test('resolution does not depend on the order files are indexed', async () => {
   assert.equal(forwardCall.confidence, backwardCall.confidence);
   assert.equal(forwardCall.confidence, 'resolved');
 });
+
+/**
+ * Re-exports.
+ *
+ * A barrel `index.ts` and a package `__init__.py` are how most TypeScript and
+ * Python code presents its public surface, so an import that lands on one is
+ * the common case rather than an exotic one. Stopping at the barrel produced
+ * an edge onto the file and still called it `resolved`, which made every
+ * caller of the real symbol vanish from find_callers and impact_of while the
+ * answer went on claiming to be trustworthy.
+ */
+
+test('a call through a TypeScript barrel reaches the definition, not the barrel', async () => {
+  const links = await linksIn({
+    'src/models/widget.ts': 'export function makeWidget(id: string) {\n  return { id };\n}\n',
+    'src/models/index.ts': "export * from './widget.js';\n",
+    'src/app.ts': [
+      "import { makeWidget } from './models/index.js';",
+      '',
+      'export function run() {',
+      "  return makeWidget('a');",
+      '}',
+      '',
+    ].join('\n'),
+  });
+
+  const call = find(links, 'calls', 'makeWidget', 'run');
+  assert.equal(call.confidence, 'resolved');
+  // The dependency on the barrel is real too, so the import keeps both ends.
+  assert.ok(
+    links.some((l) => l.type === 'imports' && l.to === 'src/models/index'),
+    'the file still depends on the barrel it named',
+  );
+});
+
+test('a renaming re-export is followed under the name the importer used', async () => {
+  const links = await linksIn({
+    'src/models/widget.ts': 'export const WIDGET_TABLE = "widgets";\n',
+    'src/models/index.ts': "export { WIDGET_TABLE as TABLE } from './widget.js';\n",
+    'src/app.ts': [
+      "import { TABLE } from './models/index.js';",
+      '',
+      'export function run() {',
+      '  return TABLE;',
+      '}',
+      '',
+    ].join('\n'),
+  });
+
+  // Specifically the importer's own edge: the barrel has one of its own to
+  // the same constant, and matching that would prove nothing.
+  find(links, 'imports', 'WIDGET_TABLE', 'src/app');
+});
+
+test('a call through a Python package __init__ reaches the definition', async () => {
+  const links = await linksIn({
+    'pkg/__init__.py': 'from pkg.widget import make_widget\n',
+    'pkg/widget.py': 'def make_widget(i):\n    return i\n',
+    'app.py': 'from pkg import make_widget\n\n\ndef run():\n    return make_widget(1)\n',
+  });
+
+  const call = find(links, 'calls', 'make_widget', 'run');
+  assert.equal(call.confidence, 'resolved');
+});
+
+test('a re-export cycle is walked without hanging', async () => {
+  const links = await linksIn({
+    'src/a.ts': "export * from './b.js';\n",
+    'src/b.ts': "export * from './a.js';\n",
+    'src/app.ts': [
+      "import { nothing } from './a.js';",
+      '',
+      'export function run() {',
+      '  return nothing();',
+      '}',
+      '',
+    ].join('\n'),
+  });
+
+  // Nothing to find, and the point is that we get here at all.
+  assert.equal(links.filter((l) => l.type === 'calls' && l.to === 'nothing').length, 0);
+});
+
+/**
+ * A Go import names a directory, and a Go package is routinely spread over
+ * several files. Resolving against only the first of them meant that which
+ * symbols were reachable came down to filename order, so the two halves of
+ * this test are the same package with the names swapped.
+ */
+async function goCallers(connFile: string, queryFile: string): Promise<Link[]> {
+  return linksIn({
+    'go.mod': 'module github.com/acme/app\n\ngo 1.22\n',
+    [`store/${connFile}`]: 'package store\n\nfunc Connect() error { return nil }\n',
+    [`store/${queryFile}`]: 'package store\n\nfunc FetchOrder(id int) error { return nil }\n',
+    'cmd/main.go': [
+      'package main',
+      '',
+      'import "github.com/acme/app/store"',
+      '',
+      'func main() {',
+      '\tstore.Connect()',
+      '\tstore.FetchOrder(7)',
+      '}',
+      '',
+    ].join('\n'),
+  });
+}
+
+test('every file of a Go package is reachable through one import', async () => {
+  for (const [conn, query] of [
+    ['aaa_conn.go', 'zzz_query.go'],
+    ['zzz_conn.go', 'aaa_query.go'],
+  ]) {
+    const links = await goCallers(conn as string, query as string);
+    const order = `${conn} then ${query}`;
+
+    const connect = find(links, 'calls', 'Connect', 'main');
+    assert.equal(connect.confidence, 'resolved', `Connect should resolve with ${order}`);
+
+    const fetch = find(links, 'calls', 'FetchOrder', 'main');
+    assert.equal(fetch.confidence, 'resolved', `FetchOrder should resolve with ${order}`);
+  }
+});

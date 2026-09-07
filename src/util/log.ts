@@ -13,10 +13,20 @@ const RANK: Record<LogLevel, number> = {
   debug: 4,
 };
 
-let current: LogLevel = (process.env.CODEGRAPH_LOG as LogLevel) || 'info';
+/**
+ * An unrecognised CODEGRAPH_LOG is ignored rather than trusted. Casting it
+ * straight through left `RANK[current]` undefined, every level comparison
+ * false, and the tool completely silent down to and including errors, which
+ * is the opposite of what someone setting the variable was reaching for.
+ */
+function parseLevel(value: string | undefined): LogLevel | null {
+  return value !== undefined && Object.hasOwn(RANK, value) ? (value as LogLevel) : null;
+}
+
+let current: LogLevel = parseLevel(process.env.CODEGRAPH_LOG) ?? 'info';
 
 export function setLogLevel(level: LogLevel): void {
-  current = level;
+  if (Object.hasOwn(RANK, level)) current = level;
 }
 
 function enabled(level: LogLevel): boolean {

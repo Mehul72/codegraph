@@ -1,7 +1,7 @@
 import { findRepoRoot } from '../../config/paths.js';
 import { detectIntegrations, integrationById, INTEGRATIONS, resolveServerCommand } from '../../integrations/index.js';
 import { installGitHooks, uninstallGitHooks } from '../../integrations/githooks.js';
-import type { Integration } from '../../integrations/types.js';
+import { cliInvocation, type Integration } from '../../integrations/types.js';
 
 export async function installCommand(names: string[]): Promise<void> {
   const repoRoot = findRepoRoot();
@@ -65,8 +65,7 @@ export async function hookCommand(action: string): Promise<void> {
 
   if (action === 'install') {
     const server = await resolveServerCommand();
-    const command = server.command === 'npx' ? 'npx -y codegraph' : server.command;
-    const report = await installGitHooks(repoRoot, command);
+    const report = await installGitHooks(repoRoot, cliInvocation(server));
     for (const note of report.notes) out(note);
     out(
       report.changed.length === 0

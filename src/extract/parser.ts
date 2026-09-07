@@ -26,7 +26,12 @@ export class MissingGrammarError extends Error {
 export class ParserPool {
   private static runtimeReady: Promise<void> | null = null;
   private readonly languages = new Map<string, Promise<Language>>();
-  private readonly parsers = new Map<string, Parser>();
+  /**
+   * Keyed on the promise, not the finished parser. Two callers that miss a
+   * half-built entry would both build one, and the loser was dropped on the
+   * floor still holding its wasm instance, which dispose() then never freed.
+   */
+  private readonly parsers = new Map<string, Promise<Parser>>();
   private readonly broken = new Set<string>();
 
   static async initRuntime(): Promise<void> {
@@ -50,25 +55,34 @@ export class ParserPool {
       return null;
     }
 
+    // Registered before the first await, so a concurrent caller waits on this
+    // build instead of starting a second one.
+    const building = this.build(grammar, file);
+    this.parsers.set(grammar, building);
+
     try {
-      await ParserPool.initRuntime();
-      let loading = this.languages.get(grammar);
-      if (!loading) {
-        loading = Language.load(file);
-        this.languages.set(grammar, loading);
-      }
-      const language = await loading;
-      const parser = new Parser();
-      parser.setLanguage(language);
-      this.parsers.set(grammar, parser);
-      log.debug(`loaded grammar ${grammar}`);
-      return parser;
+      return await building;
     } catch (err) {
       this.broken.add(grammar);
+      this.parsers.delete(grammar);
       this.languages.delete(grammar);
       log.warn(`grammar ${grammar} failed to load (${(err as Error).message}), skipping that language`);
       return null;
     }
+  }
+
+  private async build(grammar: string, file: string): Promise<Parser> {
+    await ParserPool.initRuntime();
+    let loading = this.languages.get(grammar);
+    if (!loading) {
+      loading = Language.load(file);
+      this.languages.set(grammar, loading);
+    }
+    const language = await loading;
+    const parser = new Parser();
+    parser.setLanguage(language);
+    log.debug(`loaded grammar ${grammar}`);
+    return parser;
   }
 
   /**
@@ -88,12 +102,19 @@ export class ParserPool {
   }
 
   dispose(): void {
-    for (const parser of this.parsers.values()) {
-      try {
-        parser.delete();
-      } catch {
-        // Nothing to do if the wasm instance is already gone.
-      }
+    for (const building of this.parsers.values()) {
+      // A build still in flight is settled before its parser is freed, so an
+      // abandoned one cannot outlive the pool.
+      void building.then(
+        (parser) => {
+          try {
+            parser.delete();
+          } catch {
+            // Nothing to do if the wasm instance is already gone.
+          }
+        },
+        () => {},
+      );
     }
     this.parsers.clear();
   }

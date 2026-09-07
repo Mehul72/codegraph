@@ -55,8 +55,8 @@ export async function initCommand(options: InitOptions): Promise<void> {
     out(
       `index      ${formatCount(stats.filesIndexed)} ${plural(stats.filesIndexed, 'file')}, ${formatCount(stats.nodes)} ${plural(stats.nodes, 'symbol')}, ${formatCount(stats.edges)} ${plural(stats.edges, 'edge')} in ${formatDuration(stats.durationMs)}`,
     );
-    if (stats.warnings.length > 0) {
-      const skipped = `${stats.warnings.length} ${plural(stats.warnings.length, 'file')}`;
+    if (stats.warningCount > 0) {
+      const skipped = `${formatCount(stats.warningCount)} ${plural(stats.warningCount, 'file')}`;
       out(`           ${skipped} skipped, run 'codegraph index' with CODEGRAPH_LOG=debug for detail`);
     }
     firstSymbol = pickExampleSymbol(store);

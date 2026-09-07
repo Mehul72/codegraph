@@ -15,6 +15,13 @@ import {
 /** Receivers that mean "the type I am currently inside of". */
 const SELF_RECEIVERS = new Set(['self', 'this', 'cls']);
 
+/**
+ * How many re-exports to walk through before giving up. Two barrels stacked
+ * on each other is normal; a chain longer than this is either generated code
+ * or a cycle, and neither is worth more lookups.
+ */
+const MAX_REEXPORT_HOPS = 4;
+
 export interface ResolveInput {
   store: Store;
   config: CodegraphConfig;
@@ -73,8 +80,9 @@ class Resolver {
   private readonly unresolvedRids: number[] = [];
   private readonly externalIds = new Set<string>();
   private readonly aliasCache = new Map<string, Map<string, DefNode | null>>();
-  private readonly importTargetCache = new Map<number, DefNode | null>();
+  private readonly importTargetCache = new Map<number, ImportResolution>();
   private readonly importedFilesCache = new Map<string, Set<string>>();
+  private readonly packageFilesCache = new Map<string, string[]>();
   /**
    * Which linked repo each adopted stub came from. Members of a foreign
    * module have to be looked up in that repo's index, since ours holds only
@@ -94,16 +102,20 @@ class Resolver {
   place(ref: RefRow): void {
     const targets = ref.targetKind === 'module' ? this.placeImport(ref) : this.placeName(ref);
 
-    let wrote = 0;
     for (const { node, confidence } of targets) {
       if (node.id === ref.srcId) continue; // recursion is not a useful edge
       this.write(
         { srcId: ref.srcId, dstId: node.id, type: ref.type, confidence, path: ref.path, line: ref.line },
         ref.rid,
       );
-      wrote++;
     }
-    if (wrote > 0) this.resolvedRids.push(ref.rid);
+
+    // A ref counts as placed once we know what it means, even when that
+    // produced no edge. A recursive call is the case that matters: it resolves
+    // to its own definition every time, and calling that unresolved left it
+    // being reconsidered on every incremental pass and counted against the
+    // repo in status output for ever.
+    if (targets.length > 0) this.resolvedRids.push(ref.rid);
     else this.unresolvedRids.push(ref.rid);
   }
 
@@ -126,23 +138,37 @@ class Resolver {
   // ------------------------------------------------------------- imports
 
   private placeImport(ref: RefRow): Placement[] {
-    const target = this.importTarget(ref);
+    const { target, via } = this.importResolution(ref);
     // Third-party and standard library imports do not resolve, and that is
     // the right answer rather than a failure, so nothing is logged.
-    return target ? [{ node: target, confidence: 'resolved' }] : [];
+    if (!target) return [];
+
+    // When a re-export was followed, both facts are worth an edge: the file
+    // really does depend on the barrel it named, and on the symbol it meant.
+    const placements: Placement[] = [{ node: target, confidence: 'resolved' }];
+    if (via && via.id !== target.id) placements.push({ node: via, confidence: 'resolved' });
+    return placements;
   }
 
   /** Where one import statement actually points, cached per ref. */
   private importTarget(ref: RefRow): DefNode | null {
+    return this.importResolution(ref).target;
+  }
+
+  private importResolution(ref: RefRow): ImportResolution {
     const cached = this.importTargetCache.get(ref.rid);
     if (cached !== undefined) return cached;
 
     let result: DefNode | null = null;
+    let via: DefNode | null = null;
     const module = ref.module;
     if (module) {
       const family = familyOf(ref.lang);
       const localFile = this.findImportTargetFile(family, module, ref.path);
-      if (localFile) result = this.pickImportedSymbol(localFile, ref.symbol);
+      if (localFile) {
+        result = this.pickImportedSymbol(localFile, ref.symbol);
+        if (result && result.path !== localFile) via = this.index.moduleNodeOf(localFile);
+      }
 
       // `from pkg import models` reads as a symbol import but names a module.
       // The tell is landing on the package itself: the symbol was not defined
@@ -158,8 +184,9 @@ class Resolver {
         if (hit) result = this.adoptExternal(hit.link, hit.node);
       }
     }
-    this.importTargetCache.set(ref.rid, result);
-    return result;
+    const resolution: ImportResolution = { target: result, via };
+    this.importTargetCache.set(ref.rid, resolution);
+    return resolution;
   }
 
   private findImportTargetFile(family: string, module: string, importerPath: string): string | null {
@@ -173,21 +200,85 @@ class Resolver {
   }
 
   /**
+   * Every file that answers to the same module string as `filePath`.
+   *
+   * In Go and Java a module key names a directory or a package, not a file, so
+   * an import lands on whichever file happened to sort first and the rest of
+   * the package became invisible: `store.Connect()` resolved and
+   * `store.FetchOrder()` did not, purely on filename order. Everywhere else a
+   * module is one file and this is that file on its own.
+   */
+  private packageFiles(filePath: string, family: string): string[] {
+    if (family !== 'go' && family !== 'java') return [filePath];
+
+    const cacheKey = `${family}:${filePath}`;
+    let cached = this.packageFilesCache.get(cacheKey);
+    if (!cached) {
+      const module = this.store.moduleNameForPath(filePath);
+      const siblings = module ? this.store.filesForModule(family, module) : [];
+      // The named file first, so a name defined in several files of one
+      // package still prefers the one the import actually pointed at.
+      cached = [filePath, ...siblings.filter((f) => f !== filePath)];
+      this.packageFilesCache.set(cacheKey, cached);
+    }
+    return cached;
+  }
+
+  /**
    * A named import points at one symbol, a whole-module import at the file.
-   * When a named symbol is missing it was probably re-exported from
-   * elsewhere, so we keep the dependency on the file rather than dropping it.
+   * A named symbol missing from the file it was imported from was re-exported
+   * from somewhere else, so we follow that before giving up and falling back
+   * to the file.
    */
   private pickImportedSymbol(filePath: string, symbol: string | null): DefNode | null {
-    const inFile = this.index.inFile(filePath);
     if (symbol && symbol !== 'default') {
-      const best = preferBest(inFile.filter((n) => n.name === symbol && n.kind !== 'module'));
+      const best = this.exportedSymbol(filePath, symbol, 0, new Set());
       if (best) return best;
     }
     if (symbol === 'default') {
+      const inFile = this.index.inFile(filePath);
       const best = preferBest(inFile.filter((n) => n.exported && n.kind !== 'module'));
       if (best) return best;
     }
     return this.index.moduleNodeOf(filePath);
+  }
+
+  /**
+   * The definition behind a name a file exports, following re-exports.
+   *
+   * `export * from './widget.js'` in an index file, and the `from .widget
+   * import make_widget` line in an `__init__.py`, are how most TypeScript and
+   * Python packages present their surface. Stopping at the file that was
+   * named put the edge on the barrel and still labelled it `resolved`, so
+   * every caller of the real symbol went missing while the answer claimed to
+   * be trustworthy. That is the one failure this tool must not have.
+   *
+   * Bounded by hop count and by a visited set, because barrels are circular
+   * often enough that neither guard is optional.
+   */
+  private exportedSymbol(filePath: string, symbol: string, depth: number, seen: Set<string>): DefNode | null {
+    const here = preferBest(this.index.inFile(filePath).filter((n) => n.name === symbol && n.kind !== 'module'));
+    if (here) return here;
+    if (depth >= MAX_REEXPORT_HOPS || seen.has(filePath)) return null;
+    seen.add(filePath);
+
+    for (const imp of this.imports.forFile(filePath)) {
+      if (!imp.module) continue;
+
+      // What to ask the next file for. A re-export either names the symbol,
+      // possibly renaming it on the way through, or sweeps up everything with
+      // a star. Anything else binds the name locally and is not re-exported.
+      let wanted: string | null = null;
+      if (imp.alias === symbol && imp.symbol) wanted = imp.symbol;
+      else if (imp.symbol === null && imp.alias === null) wanted = symbol;
+      if (wanted === null) continue;
+
+      const next = this.findImportTargetFile(familyOf(imp.lang), imp.module, filePath);
+      if (!next) continue;
+      const hit = this.exportedSymbol(next, wanted, depth + 1, seen);
+      if (hit) return hit;
+    }
+    return null;
   }
 
   /** What a local binding introduced by an import refers to. */
@@ -227,8 +318,11 @@ class Resolver {
     if (!cached) {
       cached = new Set<string>();
       for (const imp of this.imports.forFile(filePath)) {
-        const target = this.importTarget(imp);
+        // Both ends of a re-export count as imported: the barrel is what the
+        // source names, and the file behind it is where the symbol lives.
+        const { target, via } = this.importResolution(imp);
         if (target) cached.add(target.path);
+        if (via) cached.add(via.path);
       }
       this.importedFilesCache.set(filePath, cached);
     }
@@ -290,14 +384,14 @@ class Resolver {
       const head = qualifier.includes('.') ? (qualifier.split('.')[0] as string) : qualifier;
       const holder = this.aliasTarget(ref.path, head) ?? this.aliasTarget(ref.path, qualifier);
       if (holder) {
-        const member = this.resolveMemberOf(holder, name);
+        const member = this.resolveMemberOf(holder, name, familyOf(ref.lang));
         if (member) return [{ node: member, confidence: 'resolved' }];
       }
 
       // 5. Or it names a type declared right here: `Order.create()`.
       const localType = sameFile.find((n) => n.name === head && isTypeKind(n));
       if (localType) {
-        const member = this.resolveMemberOf(localType, name);
+        const member = this.resolveMemberOf(localType, name, familyOf(ref.lang));
         if (member) return [{ node: member, confidence: 'resolved' }];
       }
     }
@@ -361,14 +455,18 @@ class Resolver {
   }
 
   /** A member on a named type or module, following base types one level up. */
-  private resolveMemberOf(holder: DefNode, name: string): DefNode | null {
+  private resolveMemberOf(holder: DefNode, name: string, family: string): DefNode | null {
     // A holder from a linked repo lives in a file our index knows nothing
     // about, so ask the repo that owns it.
     const owner = this.foreignOwners.get(holder.id);
     if (owner) return this.resolveForeignMemberOf(owner, holder, name);
 
     if (holder.kind === 'module') {
-      return preferBest(this.index.inFile(holder.path).filter((n) => n.name === name && n.kind !== 'module'));
+      const candidates: DefNode[] = [];
+      for (const file of this.packageFiles(holder.path, family)) {
+        candidates.push(...this.index.inFile(file).filter((n) => n.name === name && n.kind !== 'module'));
+      }
+      return preferBest(candidates);
     }
     if (!isTypeKind(holder) || !holder.qualified) return null;
 
@@ -423,8 +521,14 @@ class Resolver {
    */
   private adoptExternal(link: LinkedRepo, node: GraphNode): DefNode {
     if (!this.externalIds.has(node.id)) {
-      this.store.insertNode({ ...node, repo: link.name }, true);
-      this.externalIds.add(node.id);
+      // Never write over a node this repo defines itself. insertNode upserts
+      // on the id, and external = 1 would hide our own symbol from every
+      // count and listing. Colliding ids mean two repos sharing a name, which
+      // is worth resolving against in memory but never worth persisting.
+      if (!this.store.hasLocalNode(node.id)) {
+        this.store.insertNode({ ...node, repo: link.name }, true);
+        this.externalIds.add(node.id);
+      }
     }
     this.foreignOwners.set(node.id, link);
     return {
@@ -441,6 +545,14 @@ class Resolver {
 interface Placement {
   node: DefNode;
   confidence: Confidence;
+}
+
+/** What an import statement landed on, and the barrel it went through. */
+interface ImportResolution {
+  /** The symbol the import names, or the file when we cannot narrow it. */
+  target: DefNode | null;
+  /** The module actually named in the source, when a re-export was followed. */
+  via: DefNode | null;
 }
 
 function isTypeKind(node: DefNode): boolean {

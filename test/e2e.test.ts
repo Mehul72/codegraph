@@ -176,6 +176,10 @@ test('flow three: touch reindexes one file, which is what the agent hooks call',
   const touched = await cli(repo, ['touch', 'app/service.py']);
   assert.equal(touched.code, 0, touched.stderr);
 
+  // This is the user-visible flow, and it passes whether the work was done by
+  // touch or by the freshness check the query runs. Once it did exactly that
+  // and hid a touch that indexed nothing, so the isolated version of this
+  // assertion lives in scope.test.ts.
   const where = await cli(repo, ['where', 'cancel']);
   assert.match(where.stdout, /app\/service\.py:\d+/, 'the new method should be findable immediately');
 });
@@ -336,5 +340,32 @@ test('help lists the commands a new user needs first', async () => {
   assert.equal(result.code, 0, result.stderr);
   for (const command of ['init', 'index', 'status', 'mcp', 'impact-of', 'overview']) {
     assert.match(result.stdout, new RegExp(command), `help should mention ${command}`);
+  }
+});
+
+/**
+ * changed_since answers "what did I just do", and a file the agent has only
+ * created is the most likely thing for it to have just done. `git diff` cannot
+ * see an untracked file, so asking it alone left that file out of the one
+ * answer whose whole job was to report it.
+ */
+test('changed_since sees a file that is new and not yet tracked', async () => {
+  const repo = await makeRepo('flow-untracked', APP);
+
+  const git = (...args: string[]) =>
+    run('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=test', ...args], { cwd: repo });
+  await git('init', '-q');
+  await git('add', '-A');
+  await git('commit', '-qm', 'first');
+
+  await writeFile(repo, 'app/extra.py', 'def brand_new():\n    return 1\n');
+  assert.equal((await cli(repo, ['index'])).code, 0);
+
+  const session = await Session.open({ cwd: repo });
+  try {
+    const out = await runTool(session, 'changed_since', { ref: 'HEAD' });
+    assert.match(out, /app\/extra\.py/, 'a newly created file is a change like any other');
+  } finally {
+    session.close();
   }
 });

@@ -13,8 +13,10 @@ CREATE TABLE meta (
   value TEXT NOT NULL
 );
 
--- Drives incremental indexing. One row per file we have looked at, including
--- files we chose not to parse, so we do not re-stat and re-read them forever.
+-- Drives incremental indexing. One row per file we actually parsed, and only
+-- those: a file with no extractor, or one over maxFileBytes, is walked and
+-- skipped without a row. planWork relies on that, since it treats a cached
+-- file that has become unparseable exactly like a deleted one.
 CREATE TABLE files (
   path       TEXT PRIMARY KEY,
   hash       TEXT NOT NULL,

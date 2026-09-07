@@ -80,11 +80,53 @@ export async function walkRepo(options: WalkOptions): Promise<WalkedFile[]> {
   const roots = options.only && options.only.length > 0 ? [...options.only] : [''];
 
   for (const start of roots) {
+    // A scope is just as often a single file as a directory: the CLI takes
+    // `codegraph index src/app.ts`, and the agent edit hooks pass the exact
+    // file that was written. Handing a file to descend() only produced an
+    // ENOTDIR that was logged at debug and swallowed, so the whole run
+    // indexed nothing and still reported success.
+    if (start !== '' && !(await isDirectory(path.join(repoRoot, start)))) {
+      await addFile(repoRoot, start, rootLayers, results);
+      continue;
+    }
     await descend(repoRoot, start, rootLayers, results);
   }
 
   results.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
   return results;
+}
+
+async function isDirectory(absPath: string): Promise<boolean> {
+  try {
+    return (await fsp.stat(absPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record one file, if the ignore rules allow it and it is still there. A
+ * missing file is not an error: a scoped run is often handed a path that was
+ * just deleted, and planWork removes it from the index by not seeing it here.
+ */
+async function addFile(
+  repoRoot: string,
+  rel: string,
+  layers: readonly IgnoreLayer[],
+  out: WalkedFile[],
+): Promise<void> {
+  if (isTempName(path.posix.basename(rel)) || isIgnored(layers, rel, false)) return;
+
+  const absPath = path.join(repoRoot, rel);
+  let stat;
+  try {
+    stat = await fsp.stat(absPath);
+  } catch {
+    return;
+  }
+  if (!stat.isFile()) return;
+
+  out.push({ relPath: toPosix(rel), absPath, size: stat.size, mtimeMs: stat.mtimeMs });
 }
 
 async function descend(repoRoot: string, relDir: string, layers: IgnoreLayer[], out: WalkedFile[]): Promise<void> {
@@ -113,7 +155,7 @@ async function descend(repoRoot: string, relDir: string, layers: IgnoreLayer[], 
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   for (const entry of entries) {
-    if (entry.name.startsWith('.codegraph-tmp-')) continue;
+    if (isTempName(entry.name)) continue;
     const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
 
     if (entry.isDirectory()) {
@@ -156,6 +198,16 @@ function toPatterns(text: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line !== '' && !line.startsWith('#'));
+}
+
+/**
+ * Half-written files from util/fs writeTextFile, which names them
+ * `<file>.codegraph-tmp-<pid>`. The suffix is what identifies them: matching
+ * on a prefix instead never fired, so a config being rewritten during a walk
+ * could be picked up mid-rename.
+ */
+function isTempName(name: string): boolean {
+  return name.includes('.codegraph-tmp-');
 }
 
 function isIgnored(layers: readonly IgnoreLayer[], relPath: string, isDir: boolean): boolean {

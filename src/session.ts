@@ -141,5 +141,6 @@ function emptyStats(): IndexStats {
     unresolvedRefs: 0,
     durationMs: 0,
     warnings: [],
+    warningCount: 0,
   };
 }

@@ -62,10 +62,13 @@ export function formatStats(stats: IndexStats): string {
   if (stats.filesRemoved > 0) {
     lines.push(`${formatCount(stats.filesRemoved)} deleted ${plural(stats.filesRemoved, 'file')} removed from the index`);
   }
-  if (stats.warnings.length > 0) {
-    lines.push(`skipped ${stats.warnings.length} ${plural(stats.warnings.length, 'file')}:`);
-    for (const warning of stats.warnings.slice(0, 5)) lines.push(`  ${warning}`);
-    if (stats.warnings.length > 5) lines.push(`  and ${stats.warnings.length - 5} more`);
+  if (stats.warningCount > 0) {
+    lines.push(`skipped ${formatCount(stats.warningCount)} ${plural(stats.warningCount, 'file')}:`);
+    const quoted = stats.warnings.slice(0, 5);
+    for (const warning of quoted) lines.push(`  ${warning}`);
+    if (stats.warningCount > quoted.length) {
+      lines.push(`  and ${formatCount(stats.warningCount - quoted.length)} more`);
+    }
   }
   return lines.join('\n');
 }

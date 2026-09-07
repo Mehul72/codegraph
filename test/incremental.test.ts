@@ -213,3 +213,87 @@ test('a syntax error in one file does not stop the index', async () => {
   assert.ok(indexed.store.nodesInFile('pkg/models.py').length > 0);
   indexed.close();
 });
+
+test('a file rewritten with identical content is not reparsed, and the graph is unchanged', async () => {
+  const root = await makeRepo('incremental-rewrite', BASE);
+  const first = await indexRepo(root);
+  const before = snapshot(first.store);
+  first.close();
+
+  // What a branch switch, a rebase or a formatter leaves behind: a new mtime
+  // over byte-identical content.
+  await writeFile(root, 'pkg/models.py', BASE['pkg/models.py'] as string);
+
+  const second = await indexRepo(root);
+  try {
+    assert.equal(second.stats.filesIndexed, 0, 'an unchanged hash should save the parse');
+    assert.deepEqual(snapshot(second.store), before, 'and the graph must be exactly as it was');
+  } finally {
+    second.close();
+  }
+
+  // The refreshed mtime has to be recorded, or every later pass re-reads and
+  // re-hashes the same file for ever.
+  const third = await indexRepo(root);
+  try {
+    assert.equal(third.stats.filesIndexed, 0);
+  } finally {
+    third.close();
+  }
+});
+
+/**
+ * A file can stop being indexable without being deleted: it grows past
+ * maxFileBytes, or its language is taken out of config.languages. Both used
+ * to leave every symbol it had contributed sitting in the graph for ever,
+ * because planWork marked the file as seen before deciding to skip it and
+ * staleFiles therefore never considered it gone. The graph then reported
+ * symbols at lines that no longer held them, which is the one failure mode
+ * this whole file exists to rule out.
+ */
+test('a file that grows past maxFileBytes loses its symbols', async () => {
+  const root = await makeRepo('sample', BASE);
+  const first = await indexRepo(root);
+  assert.equal(first.store.nodesByName('make_order').length, 1);
+  first.close();
+
+  await writeFile(root, 'pkg/models.py', 'X = 1\n'.padEnd(5000, '#'));
+  const { loadConfig, saveConfig } = await import('../src/config/config.js');
+  const config = await loadConfig(root);
+  await saveConfig(root, { ...config, maxFileBytes: 100 });
+
+  const after = await indexRepo(root);
+  assert.equal(after.store.nodesByName('make_order').length, 0, 'symbols of an unparseable file must not survive');
+  assert.equal(after.store.nodesInFile('pkg/models.py').length, 0);
+  after.close();
+});
+
+test('narrowing config.languages drops the symbols of the excluded language', async () => {
+  const root = await makeRepo('sample', { ...BASE, 'app.go': 'package app\n\nfunc Handle() int { return 1 }\n' });
+  const first = await indexRepo(root);
+  assert.equal(first.store.nodesByName('Handle').length, 1);
+  assert.equal(first.store.nodesByName('make_order').length, 1);
+  first.close();
+
+  const { loadConfig, saveConfig } = await import('../src/config/config.js');
+  const config = await loadConfig(root);
+  await saveConfig(root, { ...config, languages: ['python'] });
+
+  const after = await indexRepo(root);
+  assert.equal(after.store.nodesByName('Handle').length, 0, 'a disabled language must not keep its symbols');
+  assert.equal(after.store.nodesByName('make_order').length, 1, 'the languages still enabled are untouched');
+  after.close();
+});
+
+test('a file skipped on every pass never enters the index or the deleted list', async () => {
+  const root = await makeRepo('sample', { ...BASE, 'logo.svg': '<svg/>\n', 'notes.md': '# notes\n' });
+  const first = await indexRepo(root);
+  first.close();
+
+  // Nothing to remove on a second pass: files that were never indexable have
+  // no row to drop, so they must not be reported as deletions every time.
+  const second = await indexRepo(root);
+  assert.equal(second.stats.filesRemoved, 0);
+  assert.ok(second.stats.filesSkipped > 0, 'the unparseable files are still counted as skipped');
+  second.close();
+});

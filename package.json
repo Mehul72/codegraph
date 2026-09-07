@@ -27,7 +27,7 @@
     ".": "./dist/api.js"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "files": [
     "dist",
@@ -39,8 +39,8 @@
     "prepare": "npm run build",
     "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "grammars": "node scripts/fetch-grammars.mjs",
-    "test": "node --experimental-sqlite --no-warnings --import tsx --test test/*.test.ts",
-    "bench": "node --experimental-sqlite --no-warnings --import tsx scripts/bench.mjs",
+    "test": "node --no-warnings --import tsx --test test/*.test.ts",
+    "bench": "node --no-warnings --import tsx scripts/bench.mjs",
     "typecheck": "tsc -p tsconfig.test.json",
     "prepublishOnly": "npm run grammars && npm run typecheck && npm run build && npm test"
   },

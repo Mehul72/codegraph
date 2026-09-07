@@ -54,7 +54,8 @@ export function extractorFor(relPath: string): Extractor | null {
   const exact = byFilename.get(base);
   if (exact) return exact;
 
-  // Longest extension wins, so .d.ts style compound suffixes stay possible.
+  // The last dot wins, so `widget.d.ts` and `widget.test.ts` are both just
+  // TypeScript. A compound suffix would need its own entry in byFilename.
   const dot = base.lastIndexOf('.');
   if (dot <= 0) return null;
   return byExtension.get(base.slice(dot)) ?? null;

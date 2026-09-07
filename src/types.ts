@@ -124,5 +124,8 @@ export interface IndexStats {
   edges: number;
   unresolvedRefs: number;
   durationMs: number;
+  /** A sample of the files that failed to parse, capped for display. */
   warnings: string[];
+  /** How many there really were, which is what the CLI must report. */
+  warningCount: number;
 }

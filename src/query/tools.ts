@@ -2,7 +2,7 @@ import path from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { EdgeType, GraphNode, NodeKind } from '../types.js';
 import type { Store } from '../store/store.js';
-import { registryPath } from '../config/paths.js';
+import { configPath, registryPath } from '../config/paths.js';
 import { Answer, normalizeBudget } from './budget.js';
 import { fuzzySearch, lookupSymbol } from './lookup.js';
 import {
@@ -371,7 +371,7 @@ export function shortestPathTool(ctx: ToolContext, args: PathArgs): string {
 
   const hops = findPath(ctx.store, from.id, to.id);
   if (hops === null) {
-    answer.add(`no path between ${from.name} and ${to.name} within 8 hops`);
+    answer.add(`no path between ${from.name} and ${to.name} within 8 hops of either one`);
     answer.add('they may be connected only through code this index does not cover, such as a framework or a queue');
     return answer.render();
   }
@@ -553,7 +553,11 @@ export async function changedSince(ctx: ToolContext, args: ChangedArgs): Promise
     throw err;
   }
 
-  const indexed = files.filter((file) => ctx.store.nodesInFile(file).length > 0);
+  // Kept as (file, symbols) pairs: the filter and the loop below both need
+  // the node list, and looking it up twice per changed file was pure waste.
+  const indexed = files
+    .map((file) => ({ file, nodes: ctx.store.nodesInFile(file) }))
+    .filter((entry) => entry.nodes.length > 0);
   if (indexed.length === 0) {
     answer.add(`${countPhrase(files.length, 'file')} changed since ${args.ref}, none containing indexed symbols`);
     if (files.length > 0) answer.addAll(files.slice(0, 10).map((f) => `  ${f}`));
@@ -562,8 +566,8 @@ export async function changedSince(ctx: ToolContext, args: ChangedArgs): Promise
 
   answer.add(`${countPhrase(indexed.length, 'changed file')} since ${args.ref}`);
 
-  for (const file of indexed) {
-    const symbols = ctx.store.nodesInFile(file).filter((n) => n.kind !== 'module');
+  for (const { file, nodes: inFile } of indexed) {
+    const symbols = inFile.filter((n) => n.kind !== 'module');
     if (!answer.add(`${file} (${countPhrase(symbols.length, 'symbol')})`)) break;
 
     const reached = traverse({
@@ -593,7 +597,7 @@ export async function changedSince(ctx: ToolContext, args: ChangedArgs): Promise
 
 function notFound(answer: Answer, ctx: ToolContext, query: string): string {
   answer.add(`no symbol named "${query}" in the ${ctx.repo} index`);
-  const close = fuzzySearch(ctx.store, query.split(/[.:/]/).pop() ?? query, 5);
+  const close = fuzzySearch(ctx.store, query.split(/[.:/]/).at(-1) as string, 5);
   if (close.length > 0) {
     answer.add('did you mean:');
     for (const node of close) answer.add(symbolLine(node, ctx.repo));
@@ -658,15 +662,37 @@ export function toolContext(session: {
 }
 
 /**
- * Cheap check for "is this repo a dependency of another indexed repo". Only a
- * boolean is needed, so reading the registry file is enough and we avoid
- * opening every other database for a query that will not need it.
+ * Is this repo a dependency of another indexed repo?
+ *
+ * Only the small config files are read, never the other databases, because a
+ * false answer here is expensive in both directions: saying no hides real
+ * cross-repo callers, and saying yes makes every find_callers and impact_of
+ * open and query every registered index. The earlier version answered yes as
+ * soon as the registry held any other repo at all, which is true the moment
+ * you have indexed two unrelated projects.
  */
 function hasIncomingLinks(repoRoot: string): boolean {
+  const self = path.resolve(repoRoot);
+
+  let roots: string[];
   try {
     const parsed = JSON.parse(readFileSync(registryPath(), 'utf8')) as { repos?: Array<{ root: string }> };
-    return (parsed.repos ?? []).some((r) => path.resolve(r.root) !== path.resolve(repoRoot));
+    roots = (parsed.repos ?? []).map((r) => path.resolve(r.root)).filter((root) => root !== self);
   } catch {
+    return false;
+  }
+
+  return roots.some((root) => linksTo(root, self));
+}
+
+/** Does the repo at `root` list `target` among the repos it resolves against? */
+function linksTo(root: string, target: string): boolean {
+  try {
+    const config = JSON.parse(readFileSync(configPath(root), 'utf8')) as { links?: unknown };
+    if (!Array.isArray(config.links)) return false;
+    return config.links.some((link) => typeof link === 'string' && path.resolve(link) === target);
+  } catch {
+    // No config, or one we cannot read. Nothing links here as far as we know.
     return false;
   }
 }

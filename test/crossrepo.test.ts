@@ -4,7 +4,8 @@ import { cleanupRepos, indexRepo, makeRepo, useTempHome } from './helpers.js';
 import { loadConfig, saveConfig } from '../src/config/config.js';
 import { loadRegistry, registerRepo, resolveRepoRef, unregisterRepo } from '../src/config/registry.js';
 import { foreignCallers } from '../src/query/crossrepo.js';
-import { findCallers, impactOf, type ToolContext } from '../src/query/tools.js';
+import { findCallers, impactOf, toolContext, type ToolContext } from '../src/query/tools.js';
+import path from 'node:path';
 
 beforeEach(useTempHome);
 after(cleanupRepos);
@@ -280,4 +281,46 @@ test('a call through a linked module is resolved, not a name match', async () =>
     'the import names the package, so the member lookup is evidence rather than a guess',
   );
   service.close();
+});
+
+/**
+ * Whether a repo bothers looking outside itself is decided by hasLinks, and
+ * both wrong answers cost something: no means real cross-repo callers go
+ * unreported, yes means every find_callers and impact_of opens and queries
+ * every other registered index. It used to answer yes as soon as the registry
+ * held any other repo at all, which is true the moment you index two unrelated
+ * projects on one machine.
+ */
+test('a repo only looks outside itself when something actually links to it', async () => {
+  const library = await makeRepo('links-library', LIBRARY);
+  const service = await makeRepo('links-service', SERVICE);
+  const bystander = await makeRepo('links-bystander', { 'main.go': 'package main\n\nfunc main() {}\n' });
+
+  for (const root of [library, service, bystander]) {
+    const indexed = await indexRepo(root);
+    indexed.close();
+    await registerRepo(path.basename(root), root);
+  }
+
+  const contextFor = async (root: string) => {
+    const config = await loadConfig(root);
+    const store = (await indexRepo(root)).store;
+    try {
+      return toolContext({ store, config, repoRoot: root });
+    } finally {
+      store.close();
+    }
+  };
+
+  // Three repos registered, none linked to any other.
+  assert.equal((await contextFor(library)).hasLinks, false, 'an unrelated neighbour is not a link');
+
+  // Now the service resolves against the library.
+  const serviceConfig = await loadConfig(service);
+  serviceConfig.links = [library];
+  await saveConfig(service, serviceConfig);
+
+  assert.equal((await contextFor(library)).hasLinks, true, 'the library is now depended on');
+  assert.equal((await contextFor(service)).hasLinks, true, 'and the service has an outgoing link');
+  assert.equal((await contextFor(bystander)).hasLinks, false, 'the bystander is still on its own');
 });

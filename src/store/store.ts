@@ -94,6 +94,10 @@ export class Store {
         db.exec('PRAGMA journal_mode = WAL');
         db.exec('PRAGMA synchronous = NORMAL');
       }
+      // Two writers still have to take turns, though, and SQLite's default is
+      // to fail the loser instantly rather than wait for its turn. Nothing
+      // here is slow enough to be worth abandoning after a few milliseconds.
+      db.exec('PRAGMA busy_timeout = 5000');
       db.exec('PRAGMA temp_store = MEMORY');
       db.exec('PRAGMA cache_size = -32000');
     } catch (err) {
@@ -106,6 +110,15 @@ export class Store {
   }
 
   private migrate(): void {
+    // The loop below runs migrations up to MIGRATIONS.length and then stamps
+    // SCHEMA_VERSION. If those ever disagree the database is labelled with a
+    // version whose migrations never ran, and every later read is a mystery.
+    if (MIGRATIONS.length !== SCHEMA_VERSION) {
+      throw new Error(
+        `codegraph build error: ${MIGRATIONS.length} migrations for schema version ${SCHEMA_VERSION}`,
+      );
+    }
+
     const row = this.queryOne<{ user_version: number }>('PRAGMA user_version');
     const version = Number(row?.user_version ?? 0);
     if (version > SCHEMA_VERSION) {
@@ -281,6 +294,21 @@ export class Store {
   }
 
   // --------------------------------------------------------------- nodes
+
+  /**
+   * True when this id already belongs to a node we parsed ourselves. A stub
+   * from a linked repo must not land on top of one: ids are
+   * repo:path:kind:qualified and the repo segment defaults to the directory
+   * basename, so two checkouts that happen to share a directory name collide,
+   * and the local node would be flipped to external = 1 and disappear from
+   * nodeCount, nodesInFile and overview.
+   */
+  hasLocalNode(id: string): boolean {
+    return this.queryOne<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM nodes WHERE id = ? AND external = 0',
+      id,
+    )?.n === 1;
+  }
 
   insertNode(node: GraphNode, external = false): void {
     this.exec(

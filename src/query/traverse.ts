@@ -36,6 +36,14 @@ export const IMPACT_TYPES: readonly EdgeType[] = [
 const DEFAULT_MAX_NODES = 2000;
 
 /**
+ * A far looser ceiling for shortest_path, because here the cap is a safety
+ * net rather than a budget: stopping early turns a real connection into "no
+ * path", which is a wrong answer, not a short one. It exists only so that an
+ * undirected walk through a hub cannot build and sort an unbounded step list.
+ */
+const PATH_MAX_NODES = 20_000;
+
+/**
  * Breadth-first walk over the graph, one level at a time so each level is a
  * single batched query rather than one query per node.
  */
@@ -84,14 +92,23 @@ export function compareEdges(a: EdgeRow, b: EdgeRow): number {
  * call direction, and an answer of "they do not" when a path exists backwards
  * would be unhelpful.
  */
-export function shortestPath(store: Store, fromId: string, toId: string, maxDepth = 8): EdgeRow[] | null {
+export function shortestPath(
+  store: Store,
+  fromId: string,
+  toId: string,
+  maxDepth = 8,
+  maxNodes = PATH_MAX_NODES,
+): EdgeRow[] | null {
   if (fromId === toId) return [];
 
   const cameFrom = new Map<string, { prev: string; edge: EdgeRow }>();
   const seen = new Set<string>([fromId]);
   let frontier = [fromId];
 
-  for (let level = 0; level < maxDepth && frontier.length > 0; level++) {
+  // Undirected search through a hub fans out in both directions at once, so
+  // this is the query most able to run away, and it was the one with no
+  // ceiling at all.
+  for (let level = 0; level < maxDepth && frontier.length > 0 && seen.size < maxNodes; level++) {
     const out = store.outgoing(frontier);
     const back = store.incoming(frontier);
     const steps: Array<{ from: string; to: string; edge: EdgeRow }> = [];
@@ -107,6 +124,7 @@ export function shortestPath(store: Store, fromId: string, toId: string, maxDept
       cameFrom.set(step.to, { prev: step.from, edge: step.edge });
       if (step.to === toId) return rebuild(cameFrom, fromId, toId);
       next.push(step.to);
+      if (seen.size >= maxNodes) break;
     }
     frontier = next;
   }
