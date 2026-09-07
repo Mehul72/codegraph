@@ -27,12 +27,19 @@ src/query/tools.ts
 
 ## Install
 
-Node 22 or newer. Nothing to compile, no language toolchains to install: the
-parsers ship as WebAssembly.
+Node 22.5 or newer. Nothing to compile and no language toolchains to install:
+the parsers ship as WebAssembly, and the TypeScript build runs itself on
+install.
+
+```
+npm install -g github:Mehul72/codegraph
+```
+
+Then, in any repo you want indexed:
 
 ```
 cd your-repo
-npx codegraph init
+codegraph init
 ```
 
 That detects the repo root and its languages, builds the index, finds every
@@ -40,7 +47,7 @@ coding agent you have installed, and wires itself into each one. Then restart
 your agent. That is the whole setup.
 
 ```
-$ npx codegraph init
+$ codegraph init
 codegraph init in /Users/you/code/shop
 languages  Python
 config     wrote codegraph.config.json
@@ -55,11 +62,14 @@ Your agents will call it themselves for structural questions. To see what they w
   codegraph status
 ```
 
-To install it properly rather than through `npx`:
+To try it once without installing anything:
 
 ```
-npm install -g codegraph
+npx github:Mehul72/codegraph init
 ```
+
+Not on npm: the `codegraph` name there belongs to an unrelated package, so
+install from this repository rather than from the registry.
 
 ## What the agent gets
 

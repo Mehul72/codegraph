@@ -13,6 +13,12 @@
     "copilot"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mehul72/codegraph.git"
+  },
+  "homepage": "https://github.com/Mehul72/codegraph#readme",
+  "bugs": "https://github.com/Mehul72/codegraph/issues",
   "type": "module",
   "bin": {
     "codegraph": "dist/cli/main.js"
@@ -30,6 +36,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prepare": "npm run build",
     "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "grammars": "node scripts/fetch-grammars.mjs",
     "test": "node --experimental-sqlite --no-warnings --import tsx --test test/*.test.ts",
