@@ -32,8 +32,13 @@ the parsers ship as WebAssembly and the compiled JavaScript is committed, so
 installing is a download and nothing else.
 
 ```
-npm install -g github:Mehul72/codegraph
+npm install -g https://github.com/Mehul72/codegraph/archive/refs/heads/main.tar.gz
 ```
+
+The tarball rather than `npm install -g github:Mehul72/codegraph`, which npm
+installs by symlinking the package to a clone in its own cache and then
+deleting the clone, leaving a `codegraph` on your PATH that points at nothing.
+The tarball form is unaffected and needs no toolchain.
 
 Then, in any repo you want indexed:
 
