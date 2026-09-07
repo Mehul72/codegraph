@@ -1,0 +1,51 @@
+{
+  "name": "codegraph",
+  "version": "0.1.0",
+  "description": "Local code knowledge graph that answers structural questions for AI coding agents in a few hundred tokens instead of a few thousand.",
+  "keywords": [
+    "mcp",
+    "code-graph",
+    "static-analysis",
+    "tree-sitter",
+    "claude-code",
+    "cursor",
+    "codex",
+    "copilot"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "codegraph": "dist/cli/main.js"
+  },
+  "exports": {
+    ".": "./dist/api.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "files": [
+    "dist",
+    "grammars",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
+    "grammars": "node scripts/fetch-grammars.mjs",
+    "test": "node --experimental-sqlite --no-warnings --import tsx --test test/*.test.ts",
+    "bench": "node --experimental-sqlite --no-warnings --import tsx scripts/bench.mjs",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "prepublishOnly": "npm run grammars && npm run typecheck && npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "commander": "^14.0.1",
+    "ignore": "^7.0.5",
+    "web-tree-sitter": "^0.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

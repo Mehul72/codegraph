@@ -1,0 +1,55 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { claudeIntegration } from './claude.js';
+import { codexIntegration } from './codex.js';
+import { copilotIntegration } from './copilot.js';
+import { cursorIntegration } from './cursor.js';
+import type { Integration, ServerCommand } from './types.js';
+
+const run = promisify(execFile);
+
+export const INTEGRATIONS: readonly Integration[] = [
+  claudeIntegration,
+  cursorIntegration,
+  codexIntegration,
+  copilotIntegration,
+];
+
+export function integrationById(id: string): Integration | null {
+  return INTEGRATIONS.find((agent) => agent.id === id.toLowerCase()) ?? null;
+}
+
+export async function detectIntegrations(repoRoot: string): Promise<Integration[]> {
+  const found: Integration[] = [];
+  for (const agent of INTEGRATIONS) {
+    if (await agent.detect(repoRoot)) found.push(agent);
+  }
+  return found;
+}
+
+/**
+ * How the agent should launch our MCP server.
+ *
+ * A bare `codegraph` is best: it stays correct across upgrades and reads
+ * cleanly in a config file that may get committed. When it is not on PATH,
+ * because the tool was run through npx and never installed, we fall back to
+ * npx so the config still works on a machine that has neither.
+ *
+ * Neither form pins a repo path. Agents launch MCP servers with the project
+ * as the working directory, and codegraph walks up to the repo root from
+ * there, so the same config file works for everyone on the team.
+ */
+export async function resolveServerCommand(): Promise<ServerCommand> {
+  if (await onPath('codegraph')) return { command: 'codegraph', args: ['mcp'] };
+  return { command: 'npx', args: ['-y', 'codegraph', 'mcp'] };
+}
+
+async function onPath(binary: string): Promise<boolean> {
+  const finder = process.platform === 'win32' ? 'where' : 'which';
+  try {
+    const { stdout } = await run(finder, [binary]);
+    return stdout.trim() !== '';
+  } catch {
+    return false;
+  }
+}

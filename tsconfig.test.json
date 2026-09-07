@@ -1,0 +1,16 @@
+// The build compiles src/ into dist/, so tsconfig.json cannot also cover the
+// tests without emitting them. This config exists to typecheck everything,
+// tests included, which is worth doing: the tests call the query tools with
+// literal argument objects, and a wrong property name there is a bug the test
+// run would otherwise report as a confusing crash.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  // Only the test code itself. test/fixtures/ holds standalone sample repos
+  // with their own path aliases and JSX, which exist to be parsed rather than
+  // compiled, and they do not belong to this project's program.
+  "include": ["src/**/*.ts", "test/*.ts"]
+}

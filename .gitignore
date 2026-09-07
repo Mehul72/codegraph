@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.codegraph/
+bench-repos/
+.scratch/
+*.tsbuildinfo
+.DS_Store

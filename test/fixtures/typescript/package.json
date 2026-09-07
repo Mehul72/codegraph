@@ -1,0 +1,10 @@
+{
+  "name": "widget-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/routes/widgets.ts",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
