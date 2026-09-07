@@ -369,3 +369,34 @@ test('changed_since sees a file that is new and not yet tracked', async () => {
     session.close();
   }
 });
+
+/**
+ * `--agents` is documented as naming agents instead of auto-detecting them,
+ * and it used to filter the detected list instead of replacing it. That made
+ * it a no-op in the one case worth having a flag for: a repo where nothing has
+ * been set up yet, which is exactly where someone reaches for it.
+ */
+test('init --agents wires up an agent that detection would not have found', async () => {
+  const repo = await makeRepo('flow-named-agent', APP);
+
+  const result = await cli(repo, ['init', '--agents', 'claude']);
+  assert.equal(result.code, 0, result.stderr);
+
+  const mcp = JSON.parse(await fsp.readFile(path.join(repo, '.mcp.json'), 'utf8')) as {
+    mcpServers?: Record<string, unknown>;
+  };
+  assert.ok(mcp.mcpServers?.['codegraph'], `nothing was wired up: ${result.stdout}`);
+});
+
+test('init --agents says so when the name is not an agent, and wires up nothing', async () => {
+  const repo = await makeRepo('flow-unknown-agent', APP);
+
+  const result = await cli(repo, ['init', '--agents', 'emacs']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /no agent called emacs/);
+  assert.equal(
+    await fsp.access(path.join(repo, '.mcp.json')).then(() => true, () => false),
+    false,
+    'an unrecognised name must not fall back to configuring everything',
+  );
+});

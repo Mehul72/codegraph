@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { cleanupRepos, makeRepo, useTempHome } from './helpers.js';
-import { INTEGRATIONS, integrationById } from '../src/integrations/index.js';
+import {
+  INTEGRATIONS,
+  integrationById,
+  PACKAGE_SPEC,
+  resolveServerCommand,
+} from '../src/integrations/index.js';
 import type { InstallContext } from '../src/integrations/types.js';
 
 // Codex keeps its MCP list in a global config file, so every test gets a fresh
@@ -278,4 +283,28 @@ test('git hooks install, re-install and uninstall without disturbing the rest of
 
   await uninstallGitHooks(root);
   assert.equal(await fsp.readFile(hook, 'utf8'), original, 'uninstall must restore the file exactly');
+});
+
+/**
+ * The npx form of the launcher goes into a config file an agent will run
+ * unattended, so the package it names has to be this one. `codegraph` on the
+ * npm registry is an unrelated package by another author, and pointing at it
+ * produced a config that installed and launched a stranger's code as an MCP
+ * server, with no symptom beyond tools that never answered.
+ */
+test('the npx launcher names this repository, never the registry name', async () => {
+  assert.notEqual(PACKAGE_SPEC, 'codegraph', 'that name belongs to someone else on npm');
+  assert.match(PACKAGE_SPEC, /^github:/);
+
+  const server = await resolveServerCommand();
+  if (server.command === 'npx') {
+    assert.ok(
+      server.args.includes(PACKAGE_SPEC),
+      `the npx launcher fetches the wrong package: npx ${server.args.join(' ')}`,
+    );
+    assert.ok(!server.args.includes('codegraph'), 'the bare registry name must not appear');
+  } else {
+    // codegraph is on PATH here, which is the branch that needs no package.
+    assert.deepEqual([server.command, ...server.args], ['codegraph', 'mcp']);
+  }
 });

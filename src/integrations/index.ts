@@ -28,6 +28,16 @@ export async function detectIntegrations(repoRoot: string): Promise<Integration[
 }
 
 /**
+ * What npx has to fetch to get this tool.
+ *
+ * The bare name `codegraph` belongs to an unrelated package on the npm
+ * registry, so it can never appear in a launcher: an agent told to run
+ * `npx -y codegraph mcp` downloads a stranger's package and runs it as an
+ * MCP server, and the only symptom is that no tool ever answers.
+ */
+export const PACKAGE_SPEC = 'github:Mehul72/codegraph';
+
+/**
  * How the agent should launch our MCP server.
  *
  * A bare `codegraph` is best: it stays correct across upgrades and reads
@@ -41,7 +51,7 @@ export async function detectIntegrations(repoRoot: string): Promise<Integration[
  */
 export async function resolveServerCommand(): Promise<ServerCommand> {
   if (await onPath('codegraph')) return { command: 'codegraph', args: ['mcp'] };
-  return { command: 'npx', args: ['-y', 'codegraph', 'mcp'] };
+  return { command: 'npx', args: ['-y', PACKAGE_SPEC, 'mcp'] };
 }
 
 async function onPath(binary: string): Promise<boolean> {

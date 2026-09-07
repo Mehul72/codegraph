@@ -6,7 +6,13 @@ import { runIndex } from '../../index/indexer.js';
 import { registerRepo } from '../../config/registry.js';
 import { walkRepo } from '../../index/walker.js';
 import { extractorFor, languageLabel } from '../../extract/registry.js';
-import { detectIntegrations, resolveServerCommand } from '../../integrations/index.js';
+import {
+  detectIntegrations,
+  integrationById,
+  INTEGRATIONS,
+  PACKAGE_SPEC,
+  resolveServerCommand,
+} from '../../integrations/index.js';
 import { pathExistsSync } from '../../util/fs.js';
 import { formatCount, formatDuration, plural } from '../../util/text.js';
 import { writeIndexGitignore } from './index-cmd.js';
@@ -116,11 +122,21 @@ async function wireUpAgents(repoRoot: string, requested: string | undefined, out
         .filter(Boolean)
     : null;
 
-  const detected = await detectIntegrations(repoRoot);
-  const agents = wanted ? detected.filter((a) => wanted.includes(a.id)) : detected;
+  // Named agents replace detection rather than narrowing it, which is what
+  // --agents is for: the flag exists precisely for the agent that detect()
+  // cannot see yet, so filtering the detected list left it doing nothing in
+  // the one situation it was reached for.
+  const named = wanted?.map((id) => ({ id, agent: integrationById(id) }));
+  for (const miss of named?.filter((entry) => entry.agent === null) ?? []) {
+    out(`agents     no agent called ${miss.id}. Known: ${INTEGRATIONS.map((a) => a.id).join(', ')}`);
+  }
+
+  const agents = named
+    ? named.flatMap((entry) => (entry.agent ? [entry.agent] : []))
+    : await detectIntegrations(repoRoot);
 
   if (agents.length === 0) {
-    out('agents     none detected. Run: codegraph install claude|cursor|codex|copilot');
+    if (!named) out('agents     none detected. Run: codegraph install claude|cursor|codex|copilot');
     return;
   }
 
@@ -134,6 +150,6 @@ async function wireUpAgents(repoRoot: string, requested: string | undefined, out
   out(`agents     ${wired.join('; ')}`);
   if (server.command === 'npx') {
     out('           codegraph is not on your PATH, so the agents will run it through npx.');
-    out('           Install it globally for faster starts: npm i -g codegraph');
+    out(`           Install it globally for faster starts: npm i -g ${PACKAGE_SPEC}`);
   }
 }
