@@ -41,6 +41,13 @@
       "tag": "v0.23.5",
       "bytes": 414641,
       "sha256": "4fdeac4ca6ca089f06c6f7e562abcac1733cd465728cc7031ebb73c2019122c4"
+    },
+    {
+      "file": "tree-sitter-swift.wasm",
+      "repo": "alex-pinkus/tree-sitter-swift",
+      "tag": "0.7.3",
+      "bytes": 3825025,
+      "sha256": "0258a7ef17303a8079ffe0748b3583d59656b5c3e8653fca7b6451b3e6689eb2"
     }
   ]
 }

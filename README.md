@@ -150,15 +150,24 @@ get are worth something.
 
 ## Languages
 
-Python, Go, TypeScript, TSX, JavaScript, Java, and SQL DDL.
+Python, Go, TypeScript, TSX, JavaScript, Java, Swift, and SQL DDL.
 
 Each has real import resolution, not just name matching: Python module paths
 and relative imports, Go package paths from `go.mod` plus package scope across
-files, TypeScript path aliases from `tsconfig.json`, Java packages and imports.
-Re-exports are followed, so a call through a barrel `index.ts` or a package
-`__init__.py` lands on the definition behind it rather than on the file in the
-middle. SQL gets tables, columns, foreign keys and views, and strings that look
-like SQL in the other languages become `queries` edges onto those tables.
+files, TypeScript path aliases from `tsconfig.json`, Java packages and imports,
+Swift module imports plus module scope across files. Re-exports are followed,
+so a call through a barrel `index.ts` or a package `__init__.py` lands on the
+definition behind it rather than on the file in the middle. SQL gets tables,
+columns, foreign keys and views, and strings that look like SQL in the other
+languages become `queries` edges onto those tables.
+
+Swift works a little differently, because a module is one scope across all of
+its files. A file's module is its SwiftPM target (the folder under `Sources/`
+or `Tests/`), or its top-level folder in an Xcode layout. Members declared in
+an extension are found wherever the extension lives, and a method call
+resolves through the type its receiver was declared with. A call on a receiver
+whose type the source never states gets no edge, because across a whole module
+a name match is a guess.
 
 ## Staying current
 
@@ -414,11 +423,14 @@ corpus.
 
 Write an extractor in `src/extract/`, implementing `Extractor` from
 `src/extract/types.ts`: which extensions you claim, which grammar you need,
-and an `extract` function returning symbols and relationships. Add
-`modulePath` and `moduleAliases` so imports can find your files. Register it
-in `src/extract/registry.ts`, add a fixture under `test/fixtures/`, and add
-the module-path rules to `src/resolve/modules.ts` if the language resolves
-imports differently from the ones already there.
+and an `extract` function returning symbols and relationships. Add the grammar
+to `scripts/fetch-grammars.mjs` and run `npm run grammars`, which records it in
+`grammars/MANIFEST.json`. Add `modulePath` and `moduleAliases` so imports can
+find your files. Register it in `src/extract/registry.ts`, add a fixture under
+`test/fixtures/`, and add the module-path rules to `src/resolve/modules.ts` if
+the language resolves imports differently from the ones already there. Scope
+rules that differ from file-by-file imports, like Go's packages and Swift's
+modules, live in `src/resolve/resolver.ts`.
 
 `src/extract/python.ts` is the reference implementation and the one to read
 first.

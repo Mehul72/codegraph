@@ -27,6 +27,13 @@ export interface Extractor {
   /** Grammar file in grammars/, or null to skip parsing entirely. */
   grammar: string | null;
 
+  /**
+   * Rewrites the source before it is parsed, to steer round a known fault in
+   * the grammar. Every character has to keep its offset: positions come from
+   * the tree, and extract still receives the original source.
+   */
+  prepareSource?(source: string): string;
+
   extract(input: ExtractInput): ExtractResult;
 
   /**

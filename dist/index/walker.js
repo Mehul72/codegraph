@@ -33,6 +33,13 @@ const ALWAYS_SKIP_DIRS = new Set([
     '.vscode-test',
     'coverage',
     '.terraform',
+    // SwiftPM checks every dependency's sources out under .build, and CocoaPods
+    // and Carthage do the same under Pods and Carthage.
+    '.build',
+    '.swiftpm',
+    'DerivedData',
+    'Pods',
+    'Carthage',
 ]);
 /**
  * Walk the repo, honouring .gitignore (including nested ones), a

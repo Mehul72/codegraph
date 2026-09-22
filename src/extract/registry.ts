@@ -5,6 +5,7 @@ import { goExtractor } from './go.js';
 import { javaExtractor } from './java.js';
 import { javascriptExtractor, tsxExtractor, typescriptExtractor } from './typescript.js';
 import { sqlExtractor } from './sql.js';
+import { swiftExtractor } from './swift.js';
 
 /**
  * The whole language registry. Adding a language is one import and one entry
@@ -17,6 +18,7 @@ export const EXTRACTORS: readonly Extractor[] = [
   tsxExtractor,
   javascriptExtractor,
   javaExtractor,
+  swiftExtractor,
   sqlExtractor,
 ];
 
@@ -73,6 +75,7 @@ export const LANGUAGE_LABELS: Record<string, string> = {
   tsx: 'TSX',
   javascript: 'JavaScript',
   java: 'Java',
+  swift: 'Swift',
   sql: 'SQL',
 };
 

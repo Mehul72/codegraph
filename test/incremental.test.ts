@@ -49,8 +49,8 @@ const BASE: Record<string, string> = {
  * that has never been indexed. Both repos are named the same, because the repo
  * name is part of every node id and the two graphs have to be comparable.
  */
-async function graphAfterChange(change: (root: string) => Promise<void>) {
-  const incremental = await makeRepo('sample', BASE);
+async function graphAfterChange(change: (root: string) => Promise<void>, base: Record<string, string> = BASE) {
+  const incremental = await makeRepo('sample', base);
   const first = await indexRepo(incremental);
   first.close();
   await change(incremental);
@@ -58,7 +58,7 @@ async function graphAfterChange(change: (root: string) => Promise<void>) {
   const incrementalGraph = snapshot(updated.store);
   updated.close();
 
-  const fromScratch = await makeRepo('sample', BASE);
+  const fromScratch = await makeRepo('sample', base);
   await change(fromScratch);
   const cold = await indexRepo(fromScratch);
   const coldGraph = snapshot(cold.store);
@@ -130,6 +130,82 @@ test('reindex after adding a new file matches a cold index', async () => {
   });
 
   assert.deepEqual(incrementalGraph.nodes, coldGraph.nodes);
+  assert.deepEqual(incrementalGraph.edges, coldGraph.edges);
+});
+
+/**
+ * Swift resolution leans on things outside the referring file: an extension
+ * in another file, a protocol in another module, the modules a file imports.
+ * Each change below moves one of those and leaves the caller untouched.
+ */
+const SWIFT_BASE: Record<string, string> = {
+  'Sources/Shop/Cart.swift': [
+    'struct Cart {',
+    '    let store: OrderStore',
+    '    func checkout() {',
+    '        applyDiscount()',
+    '        store.save()',
+    '    }',
+    '}',
+    '',
+  ].join('\n'),
+  'Sources/Shop/OrderStore.swift': 'protocol OrderStore {\n    func save()\n}\n',
+  'Sources/App/Main.swift': 'import Shop\n\nfunc run() {\n    makeCart()\n}\n',
+};
+
+test('a Swift extension appearing in another file matches a cold index', async () => {
+  const { incrementalGraph, coldGraph } = await graphAfterChange(async (root) => {
+    await writeFile(root, 'Sources/Shop/Cart+Discount.swift', 'extension Cart {\n    func applyDiscount() {}\n}\n');
+    await writeFile(root, 'Sources/Shop/Factory.swift', 'public func makeCart() {}\n');
+  }, SWIFT_BASE);
+
+  assert.ok(
+    incrementalGraph.edges.some(
+      (edge) => edge.includes('|calls|') && edge.includes(':method:Cart.applyDiscount|resolved'),
+    ),
+    'the implicit self call should now resolve',
+  );
+  assert.deepEqual(incrementalGraph.nodes, coldGraph.nodes);
+  assert.deepEqual(incrementalGraph.edges, coldGraph.edges);
+  assert.deepEqual(incrementalGraph.modules, coldGraph.modules);
+});
+
+test('a Swift requirement moving between files matches a cold index', async () => {
+  const { incrementalGraph, coldGraph } = await graphAfterChange(async (root) => {
+    await deleteFile(root, 'Sources/Shop/OrderStore.swift');
+    await writeFile(root, 'Sources/Shop/Stores.swift', 'protocol OrderStore {\n    func save()\n    func load()\n}\n');
+  }, SWIFT_BASE);
+
+  assert.deepEqual(incrementalGraph.nodes, coldGraph.nodes);
+  assert.deepEqual(incrementalGraph.edges, coldGraph.edges);
+});
+
+test('a Swift file dropping its import matches a cold index', async () => {
+  const withFactory = { ...SWIFT_BASE, 'Sources/Shop/Factory.swift': 'public func makeCart() {}\n' };
+  const { incrementalGraph, coldGraph } = await graphAfterChange(async (root) => {
+    await writeFile(root, 'Sources/App/Main.swift', 'func run() {\n    makeCart()\n}\n');
+  }, withFactory);
+
+  assert.ok(
+    !incrementalGraph.edges.some((edge) => edge.includes('function:makeCart|resolved')),
+    'without the import, the call is no longer resolved',
+  );
+  assert.deepEqual(incrementalGraph.edges, coldGraph.edges);
+});
+
+test('a Swift superclass changing in another file matches a cold index', async () => {
+  // The call sits in an extension, so its file is not reparsed when Child
+  // changes base. Following the old base from here would leave a stale edge.
+  const inheritance: Record<string, string> = {
+    'Sources/UI/Base.swift': 'class BaseScreen {\n    func track() {}\n}\n',
+    'Sources/UI/Other.swift': 'class OtherScreen {\n    func track() {}\n}\n',
+    'Sources/UI/Child.swift': 'final class Child: BaseScreen {}\n',
+    'Sources/UI/Child+Tracking.swift': 'extension Child {\n    func appear() {\n        track()\n    }\n}\n',
+  };
+  const { incrementalGraph, coldGraph } = await graphAfterChange(async (root) => {
+    await writeFile(root, 'Sources/UI/Child.swift', 'final class Child: OtherScreen {}\n');
+  }, inheritance);
+
   assert.deepEqual(incrementalGraph.edges, coldGraph.edges);
 });
 

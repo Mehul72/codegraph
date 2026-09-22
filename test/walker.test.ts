@@ -118,6 +118,10 @@ test('the usual heavy directories are skipped without being listed anywhere', as
     'target/classes/App.class': 'not really bytecode\n',
     'vendor/dep/dep.go': 'package dep\n\nfunc Dep() int {\n\treturn 1\n}\n',
     'coverage/report.js': 'export const covered = 1;\n',
+    '.build/checkouts/swift-log/Sources/Logging/Logger.swift': 'public struct Logger {}\n',
+    'Pods/Alamofire/Source/Session.swift': 'open class Session {}\n',
+    'Carthage/Checkouts/Nuke/Sources/Nuke/ImagePipeline.swift': 'public final class ImagePipeline {}\n',
+    'DerivedData/Build/Intermediates/Generated.swift': 'struct Generated {}\n',
   });
 
   const files = await walked(root);

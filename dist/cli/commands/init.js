@@ -25,7 +25,7 @@ export async function initCommand(options) {
     if (languages.length === 0) {
         out('');
         out('No files in a supported language were found here.');
-        out('codegraph reads Python, Go, TypeScript, JavaScript, Java and SQL.');
+        out('codegraph reads Python, Go, TypeScript, JavaScript, Java, Swift and SQL.');
         out('If your sources live somewhere unexpected, check your .gitignore and try again.');
         return;
     }

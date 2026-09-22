@@ -1,4 +1,5 @@
-import { familyOf } from '../extract/registry.js';
+import { extractorFor, familyOf } from '../extract/registry.js';
+import { swiftModuleOf } from '../extract/swift.js';
 import { buildDefinitionIndex, preferBest } from './definitions.js';
 import { isDefinitelyExternal, moduleCandidates, submoduleOf } from './modules.js';
 import { resolveImportAcrossRepos, resolveMemberAcrossRepos, resolveNameAcrossRepos, resolveQualifiedAcrossRepos, } from './crossrepo.js';
@@ -59,6 +60,7 @@ class Resolver {
     importTargetCache = new Map();
     importedFilesCache = new Map();
     packageFilesCache = new Map();
+    swiftScopeCache = new Map();
     /**
      * Which linked repo each adopted stub came from. Members of a foreign
      * module have to be looked up in that repo's index, since ours holds only
@@ -172,14 +174,14 @@ class Resolver {
     /**
      * Every file that answers to the same module string as `filePath`.
      *
-     * In Go and Java a module key names a directory or a package, not a file, so
-     * an import lands on whichever file happened to sort first and the rest of
-     * the package became invisible: `store.Connect()` resolved and
-     * `store.FetchOrder()` did not, purely on filename order. Everywhere else a
-     * module is one file and this is that file on its own.
+     * In Go, Java and Swift a module key names a directory, a package or a
+     * target, not a file, so an import lands on whichever file happened to sort
+     * first and the rest of the package became invisible: `store.Connect()`
+     * resolved and `store.FetchOrder()` did not, purely on filename order.
+     * Everywhere else a module is one file and this is that file on its own.
      */
     packageFiles(filePath, family) {
-        if (family !== 'go' && family !== 'java')
+        if (family !== 'go' && family !== 'java' && family !== 'swift')
             return [filePath];
         const cacheKey = `${family}:${filePath}`;
         let cached = this.packageFilesCache.get(cacheKey);
@@ -279,14 +281,32 @@ class Resolver {
     /**
      * Is `candidate` something the referring file could actually reach? Being
      * in the same file counts, being imported counts, and in Go so does being
-     * in the same directory, because that is one package with one scope.
+     * in the same directory, because that is one package with one scope. In
+     * Swift the scope is the whole module, plus every module the file imports.
      */
     isVisibleFrom(ref, candidate) {
         if (candidate.path === ref.path)
             return true;
         if (this.importedFiles(ref.path).has(candidate.path))
             return true;
-        return familyOf(ref.lang) === 'go' && dirOf(candidate.path) === dirOf(ref.path);
+        const family = familyOf(ref.lang);
+        if (family === 'swift')
+            return this.isInSwiftScope(ref.path, candidate.path);
+        return family === 'go' && dirOf(candidate.path) === dirOf(ref.path);
+    }
+    isInSwiftScope(filePath, candidatePath) {
+        if (!isSwiftFile(candidatePath))
+            return false;
+        let modules = this.swiftScopeCache.get(filePath);
+        if (!modules) {
+            modules = new Set([swiftModuleOf(filePath)]);
+            for (const imp of this.imports.forFile(filePath)) {
+                if (imp.module)
+                    modules.add(imp.module);
+            }
+            this.swiftScopeCache.set(filePath, modules);
+        }
+        return modules.has(swiftModuleOf(candidatePath));
     }
     /** Every file this file pulls something in from. */
     importedFiles(filePath) {
@@ -333,6 +353,7 @@ class Resolver {
             return this.placeTable(name);
         const qualifier = ref.qualifier?.trim() || null;
         const selfish = qualifier !== null && SELF_RECEIVERS.has(qualifier);
+        const swift = familyOf(ref.lang) === 'swift';
         const sameFile = this.index.inFile(ref.path);
         // 1. self.foo() and this.foo(), which we can pin down properly.
         if (selfish) {
@@ -340,17 +361,30 @@ class Resolver {
             if (own)
                 return [{ node: own, confidence: 'resolved' }];
         }
-        // 2. A definition in the same file, which the parser saw whole.
+        // 2. A definition in the same file, which the parser saw whole. In Swift
+        //    that leaves out a sibling type's members, which need a receiver.
         if (qualifier === null || selfish) {
-            const local = sameFile.filter((n) => n.name === name && n.kind !== 'module');
+            const enclosing = swift ? this.enclosingTypeName(ref) : null;
+            const local = sameFile.filter((n) => n.name === name && n.kind !== 'module' && (!swift || reachableInSwift(n, enclosing, selfish)));
             if (local.length === 1)
                 return [{ node: local[0], confidence: 'exact' }];
             const best = preferBest(local);
             if (best)
                 return [{ node: best, confidence: 'resolved' }];
         }
-        // 3. The bare name was imported: `from x import helper; helper()`.
-        if (qualifier === null) {
+        // Swift spreads a type over files with extensions and shares one scope
+        // across a module, which changes both where members are found and how
+        // little a name match proves. See swiftMember and swiftModuleMember.
+        if (swift) {
+            const member = this.swiftMember(ref, name, qualifier);
+            if (member)
+                return [{ node: member, confidence: 'resolved' }];
+            if (qualifier !== null)
+                return this.swiftModuleMember(ref, name, qualifier);
+        }
+        // 3. The bare name was imported: `from x import helper; helper()`. A Swift
+        //    import binds only a module's name, which never appears on its own.
+        if (qualifier === null && !swift) {
             const imported = this.aliasTarget(ref.path, name);
             if (imported)
                 return [{ node: imported, confidence: 'resolved' }];
@@ -376,9 +410,15 @@ class Resolver {
                     return [{ node: member, confidence: 'resolved' }];
             }
         }
+        // Swift arrives here only with a bare name, and swiftMember has already
+        // tried the enclosing types' members, so what is left is a top-level
+        // declaration. Never one written in another language.
         const global = this.index
             .byName(name)
-            .filter((n) => n.kind !== 'module' && n.id !== ref.srcId && callShapeFits(n, qualifier, ref.type));
+            .filter((n) => n.kind !== 'module' &&
+            n.id !== ref.srcId &&
+            callShapeFits(n, qualifier, ref.type) &&
+            (!swift || (isSwiftFile(n.path) && n.qualified === n.name)));
         // 6. The receiver is an object we cannot type, but the name is defined in
         //    exactly one file this file can see. An import is real evidence, and
         //    in Go so is sharing a package, since a package has one flat scope
@@ -452,6 +492,73 @@ class Resolver {
             return direct;
         return this.resolveInherited(holder, name, 0);
     }
+    /**
+     * A Swift member, found by the qualified name the extractor gave it. Every
+     * extension qualifies its members by the type it extends, so one lookup
+     * across the modules this file can see finds a member wherever it was
+     * declared. The type is the enclosing one for a bare or `self` call, the
+     * superclass for `super`, and otherwise the type the receiver was declared
+     * as, which the extractor wrote into the qualifier.
+     */
+    swiftMember(ref, name, qualifier) {
+        const viaSuper = qualifier === 'super';
+        const onSelf = qualifier === null || viaSuper || SELF_RECEIVERS.has(qualifier);
+        const typeName = onSelf ? this.enclosingTypeName(ref) : qualifier;
+        if (!typeName)
+            return null;
+        if (!viaSuper) {
+            const wanted = `${typeName}.${name}`;
+            const declared = preferBest(this.index
+                .byName(name)
+                .filter((n) => n.qualified === wanted && n.kind !== 'module' && this.isVisibleFrom(ref, n)));
+            if (declared)
+                return declared;
+        }
+        // Inheritance edges are still being placed while supertypes resolve, so
+        // only later refs may walk them without depending on processing order.
+        if (phase(ref) === 0)
+            return null;
+        // Only from a type declared in this file. A walk from one declared
+        // elsewhere depends on that file's superclass, and an incremental pass
+        // that reparses only that file would leave this edge on the old base.
+        const typeNode = this.index.inFile(ref.path).find((n) => isTypeKind(n) && n.qualified === typeName);
+        return typeNode ? this.resolveInherited(typeNode, name, 0) : null;
+    }
+    /**
+     * The type a reference sits inside, from the symbol that owns it: the type
+     * itself for a stored property's initializer, the declaring type for a
+     * method or a static constant, and none at the top of a file.
+     */
+    enclosingTypeName(ref) {
+        const owner = this.index.byId(ref.srcId);
+        if (!owner?.qualified)
+            return null;
+        if (isTypeKind(owner))
+            return owner.qualified;
+        if (owner.kind !== 'method' && owner.kind !== 'constant')
+            return null;
+        // Cut the owner's own name rather than splitting on dots, which an
+        // operator such as `..<` can contain.
+        const suffix = `.${owner.name}`;
+        return owner.qualified.endsWith(suffix) ? owner.qualified.slice(0, -suffix.length) : null;
+    }
+    /**
+     * What is left for a qualified Swift reference once swiftMember has missed:
+     * its qualifier names an imported module, as in `Store.makeOrder()`, and the
+     * name is declared at the top of that module. Anything else is a method on a
+     * receiver whose type the source never states, and in a scope as wide as a
+     * module a name match there is a guess, so it gets no edge.
+     */
+    swiftModuleMember(ref, name, qualifier) {
+        const [head, ...rest] = qualifier.split('.');
+        const holder = head ? this.aliasTarget(ref.path, head) : null;
+        if (holder?.kind !== 'module')
+            return [];
+        const wanted = [...rest, name].join('.');
+        const candidates = this.packageFiles(holder.path, 'swift').flatMap((file) => this.index.inFile(file).filter((n) => n.qualified === wanted && n.kind !== 'module'));
+        const best = preferBest(candidates);
+        return best ? [{ node: best, confidence: 'resolved' }] : [];
+    }
     resolveForeignMemberOf(owner, holder, name) {
         const hit = holder.kind === 'module'
             ? resolveMemberAcrossRepos(owner, holder.path, name)
@@ -524,6 +631,30 @@ function isTypeKind(node) {
 function dirOf(filePath) {
     const cut = filePath.lastIndexOf('/');
     return cut === -1 ? '' : filePath.slice(0, cut);
+}
+function isSwiftFile(filePath) {
+    return extractorFor(filePath)?.id === 'swift';
+}
+/**
+ * Whether a Swift name written with no receiver can mean `candidate`: a
+ * top-level declaration, or a member of the type it is written in or of a
+ * type around that one. Through `self`, only the type's own members count.
+ * Any other member belongs to another type and needs a receiver of that type.
+ */
+function reachableInSwift(candidate, enclosingType, viaSelf) {
+    if (candidate.qualified === candidate.name)
+        return !viaSelf;
+    if (viaSelf)
+        return enclosingType !== null && candidate.qualified === `${enclosingType}.${candidate.name}`;
+    for (let scope = enclosingType; scope !== null; scope = outerTypeOf(scope)) {
+        if (candidate.qualified === `${scope}.${candidate.name}`)
+            return true;
+    }
+    return false;
+}
+function outerTypeOf(typeName) {
+    const cut = typeName.lastIndexOf('.');
+    return cut === -1 ? null : typeName.slice(0, cut);
 }
 /**
  * Could a reference written this way plausibly mean this symbol?

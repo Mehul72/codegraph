@@ -435,3 +435,170 @@ test('every file of a Go package is reachable through one import', async () => {
     assert.equal(fetch.confidence, 'resolved', `FetchOrder should resolve with ${order}`);
   }
 });
+
+/**
+ * Swift has no per-file imports: a module is one scope across all its files,
+ * and `import Store` brings in all of Store. That makes a bare name match weak
+ * evidence in Swift, so method calls go through the type the receiver was
+ * declared with, and a receiver of unknown type gets no edge at all.
+ */
+test('two files in one Swift module see each other without an import', async () => {
+  const links = await linksIn({
+    'Sources/Store/Read.swift': 'func readAll() -> Int {\n    return 1\n}\n',
+    'Sources/Store/Write.swift': 'func writeAll() -> Int {\n    return readAll()\n}\n',
+  });
+  assert.equal(find(links, 'calls', 'readAll', 'writeAll').confidence, 'resolved');
+});
+
+test('another Swift module is in scope only through its import', async () => {
+  const links = await linksIn({
+    'Sources/Store/Orders.swift': 'public func makeOrder() -> Int {\n    return 1\n}\n',
+    'Sources/App/Main.swift': 'import Store\n\nfunc run() -> Int {\n    return makeOrder()\n}\n',
+    'Sources/Admin/Audit.swift': 'func audit() -> Int {\n    return makeOrder()\n}\n',
+  });
+
+  assert.equal(find(links, 'calls', 'makeOrder', 'run').confidence, 'resolved');
+  const unimported = links.filter((l) => l.from === 'audit' && l.to === 'makeOrder');
+  for (const link of unimported) {
+    assert.equal(link.confidence, 'heuristic', `no import means no resolution:\n${describe(links)}`);
+  }
+});
+
+test('a Swift module name used as a qualifier reaches its top-level declarations', async () => {
+  const links = await linksIn({
+    'Sources/Store/Orders.swift': 'public func makeOrder() -> Int {\n    return 1\n}\n',
+    'Sources/Store/Other.swift': 'struct Maker {\n    func makeOrder() -> Int { 2 }\n}\n',
+    'Sources/App/Main.swift': 'import Store\n\nfunc run() -> Int {\n    return Store.makeOrder()\n}\n',
+  });
+  const call = find(links, 'calls', 'makeOrder', 'run');
+  assert.equal(call.confidence, 'resolved');
+  assert.deepEqual(
+    links.filter((l) => l.type === 'calls' && l.to === 'Maker.makeOrder'),
+    [],
+    'a module-qualified call is never a method on some type in that module',
+  );
+});
+
+test('a Swift method called without self finds its extension in another file', async () => {
+  const links = await linksIn({
+    'Sources/Shop/Cart.swift': 'struct Cart {\n    func checkout() {\n        applyDiscount()\n    }\n}\n',
+    'Sources/Shop/Cart+Discount.swift': 'extension Cart {\n    func applyDiscount() {}\n}\n',
+    // Another type with the same method name, which must not be mistaken for it.
+    'Sources/Shop/Coupon.swift': 'struct Coupon {\n    func applyDiscount() {}\n}\n',
+  });
+  const call = find(links, 'calls', 'Cart.applyDiscount', 'Cart.checkout');
+  assert.equal(call.confidence, 'resolved');
+  assert.deepEqual(links.filter((l) => l.type === 'calls' && l.to === 'Coupon.applyDiscount'), []);
+});
+
+test('a Swift method call follows the declared type of its receiver', async () => {
+  const links = await linksIn({
+    'Sources/Shop/Store.swift': 'protocol OrderStore {\n    func save()\n}\n',
+    'Sources/Shop/Cache.swift': 'final class Cache {\n    func save() {}\n}\n',
+    'Sources/Shop/Service.swift': [
+      'final class Service {',
+      '    let store: OrderStore',
+      '    init(store: OrderStore) { self.store = store }',
+      '    func place() {',
+      '        store.save()',
+      '    }',
+      '}',
+      '',
+    ].join('\n'),
+  });
+  assert.equal(find(links, 'calls', 'OrderStore.save', 'Service.place').confidence, 'resolved');
+  assert.deepEqual(
+    links.filter((l) => l.type === 'calls' && l.to === 'Cache.save'),
+    [],
+    `a typed receiver is not a name match:\n${describe(links)}`,
+  );
+});
+
+test('a Swift method missing from the receiver type gets no edge rather than a guess', async () => {
+  const links = await linksIn({
+    'Sources/Shop/Helper.swift': 'struct Helper {\n    func prepare() {}\n}\n',
+    'Sources/Shop/Worker.swift': 'struct Worker {\n    func process() {}\n}\n',
+    'Sources/Shop/Job.swift': 'func run(helper: Helper) {\n    helper.process()\n}\n',
+  });
+  assert.deepEqual(links.filter((l) => l.type === 'calls' && l.from === 'run'), [], describe(links));
+});
+
+test('a Swift call reaches an inherited method, bare or through super', async () => {
+  const links = await linksIn({
+    'Sources/UI/Base.swift': 'class BaseScreen {\n    func track() {}\n}\n',
+    'Sources/UI/Checkout.swift': [
+      'final class CheckoutScreen: BaseScreen {',
+      '    func appear() {',
+      '        track()',
+      '    }',
+      '    override func track() {',
+      '        super.track()',
+      '    }',
+      '}',
+      '',
+    ].join('\n'),
+  });
+  assert.equal(find(links, 'inherits', 'BaseScreen', 'CheckoutScreen').confidence, 'resolved');
+  // The override in the same file is the nearer definition for a bare call.
+  assert.equal(find(links, 'calls', 'CheckoutScreen.track', 'CheckoutScreen.appear').confidence, 'exact');
+  assert.equal(find(links, 'calls', 'BaseScreen.track', 'CheckoutScreen.track').confidence, 'resolved');
+});
+
+test('a bare Swift call never lands in another language', async () => {
+  const links = await linksIn({
+    'tools/report.py': 'def render():\n    return 1\n',
+    'Sources/App/Screen.swift': 'func show() {\n    render()\n}\n',
+  });
+  assert.deepEqual(links.filter((l) => l.from === 'show'), [], describe(links));
+});
+
+test('an import of an Apple framework stays unresolved rather than landing on a local file', async () => {
+  const links = await linksIn({
+    'Sources/Foundation/Shim.swift': 'func shim() {}\n',
+    'Sources/App/Main.swift': 'import Foundation\n\nfunc run() {}\n',
+  });
+  assert.deepEqual(links.filter((l) => l.type === 'imports'), [], describe(links));
+});
+
+test('the indexer parses Swift through its source rewrite, so try await keeps a file whole', async () => {
+  const links = await linksIn({
+    'Sources/Shop/Loader.swift': [
+      'final class Loader {',
+      '    func load() async throws {',
+      '        if let order = try await fetch() {',
+      '            keep(order)',
+      '        }',
+      '    }',
+      '    func fetch() async throws -> Int? { nil }',
+      '    func keep(_ order: Int) {}',
+      '}',
+      '',
+    ].join('\n'),
+  });
+  assert.equal(find(links, 'calls', 'Loader.fetch', 'Loader.load').confidence, 'exact');
+  assert.equal(find(links, 'calls', 'Loader.keep', 'Loader.load').confidence, 'exact');
+});
+
+test('a bare Swift call never reaches a member of a sibling type, even in the same file', async () => {
+  const links = await linksIn({
+    'Sources/Shop/Views.swift': [
+      'struct CartView {',
+      '    func checkout() {',
+      '        save()',
+      '        Row()',
+      '        self.refresh()',
+      '    }',
+      '}',
+      'struct CouponView {',
+      '    struct Row {}',
+      '    func save() {}',
+      '    func refresh() {}',
+      '}',
+      '',
+    ].join('\n'),
+    // A nested type is out of reach without its outer type, from any file.
+    'Sources/Shop/Other.swift': 'struct Shelf {\n    func stock() {\n        Row()\n    }\n}\n',
+  });
+  const wrong = links.filter((l) => l.type === 'calls' && l.to.startsWith('CouponView.'));
+  assert.deepEqual(wrong, [], `a sibling's members need a receiver of that type:\n${describe(links)}`);
+});

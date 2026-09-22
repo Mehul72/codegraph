@@ -222,7 +222,7 @@ const EMPTY_PARSE = { nodes: [], edges: [], modules: [], family: '', warning: nu
 async function parseAndExtract(pool, extractor, relPath, source, repo) {
     let tree = null;
     if (extractor.grammar) {
-        tree = await pool.parse(extractor.grammar, source);
+        tree = await pool.parse(extractor.grammar, extractor.prepareSource?.(source) ?? source);
         if (!tree) {
             return { ...EMPTY_PARSE, family: familyOf(extractor.id), warning: `${relPath}: no usable parser, skipped` };
         }

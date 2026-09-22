@@ -140,6 +140,12 @@ const PYTHON_STDLIB = new Set([
     'signal', 'socket', 'sqlite3', 'string', 'struct', 'subprocess', 'sys', 'tempfile', 'textwrap', 'threading',
     'time', 'traceback', 'typing', 'unittest', 'urllib', 'uuid', 'warnings', 'weakref', 'zipfile',
 ]);
+/** Apple's SDK and the Swift toolchain's own modules, which nearly every file imports and no repo defines. */
+const SWIFT_SYSTEM_MODULES = new Set([
+    'AppKit', 'AVFoundation', 'Combine', 'CoreData', 'CoreGraphics', 'CoreLocation', 'CryptoKit', 'Darwin',
+    'Dispatch', 'Foundation', 'FoundationNetworking', 'Glibc', 'MapKit', 'Observation', 'OSLog', 'os', 'SwiftData',
+    'SwiftUI', 'Testing', 'UIKit', 'UserNotifications', 'WebKit', 'XCTest',
+]);
 export function isDefinitelyExternal(family, module) {
     if (STDLIB_PREFIXES.some((prefix) => module.startsWith(prefix)))
         return true;
@@ -147,6 +153,8 @@ export function isDefinitelyExternal(family, module) {
         const head = module.split('.')[0] ?? '';
         return PYTHON_STDLIB.has(head);
     }
+    if (family === 'swift')
+        return SWIFT_SYSTEM_MODULES.has(module);
     return false;
 }
 //# sourceMappingURL=modules.js.map

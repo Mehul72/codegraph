@@ -24,8 +24,11 @@ export declare function signatureOf(node: Node, bodyFieldNames?: readonly string
  * with `//`, `#` or `/* *\/`. Only the opening paragraph survives, because a
  * full docstring is often longer than the answer the agent asked for. See
  * cleanDoc for where that cut is made.
+ *
+ * A language where `#` starts code rather than a comment, like Swift's `#if`,
+ * passes a narrower `lineComment`.
  */
-export declare function leadingCommentDoc(node: Node, source: string): string | null;
+export declare function leadingCommentDoc(node: Node, source: string, lineComment?: RegExp): string | null;
 /** Python and friends put the doc inside the body as a bare string. */
 export declare function stringLiteralDoc(node: Node | null): string | null;
 /**

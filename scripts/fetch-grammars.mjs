@@ -19,6 +19,9 @@ const GRAMMARS = [
   { file: 'tree-sitter-typescript.wasm', repo: 'tree-sitter/tree-sitter-typescript', tag: 'v0.23.2' },
   { file: 'tree-sitter-tsx.wasm', repo: 'tree-sitter/tree-sitter-typescript', tag: 'v0.23.2' },
   { file: 'tree-sitter-java.wasm', repo: 'tree-sitter/tree-sitter-java', tag: 'v0.23.5' },
+  // The tree-sitter org has no Swift grammar. This is the one editors and
+  // GitHub use, and its release tags carry no leading v.
+  { file: 'tree-sitter-swift.wasm', repo: 'alex-pinkus/tree-sitter-swift', tag: '0.7.3' },
 ];
 
 async function main() {

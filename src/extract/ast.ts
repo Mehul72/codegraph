@@ -74,13 +74,23 @@ export function signatureOf(node: Node, bodyFieldNames: readonly string[] = ['bo
   return truncate(squash(raw).replace(/[\s{:=]+$/, ''), MAX_SIGNATURE);
 }
 
+/** A `//` or `#` line comment marker, with the space after it. */
+const SLASH_OR_HASH_COMMENT = /^(\/\/+|#+)\s?/;
+
 /**
  * The doc comment sitting immediately above `node`, whether it is written
  * with `//`, `#` or `/* *\/`. Only the opening paragraph survives, because a
  * full docstring is often longer than the answer the agent asked for. See
  * cleanDoc for where that cut is made.
+ *
+ * A language where `#` starts code rather than a comment, like Swift's `#if`,
+ * passes a narrower `lineComment`.
  */
-export function leadingCommentDoc(node: Node, source: string): string | null {
+export function leadingCommentDoc(
+  node: Node,
+  source: string,
+  lineComment: RegExp = SLASH_OR_HASH_COMMENT,
+): string | null {
   const lines = source.split('\n');
   let row = node.startPosition.row - 1;
   const collected: string[] = [];
@@ -91,8 +101,8 @@ export function leadingCommentDoc(node: Node, source: string): string | null {
     // between means the comment above belongs to whatever came before, which
     // is how a `// ----- section` divider ends up quoted as a symbol's doc.
     if (raw === '') break;
-    if (raw.startsWith('//') || raw.startsWith('#')) {
-      collected.unshift(raw.replace(/^(\/\/+|#+)\s?/, ''));
+    if (lineComment.test(raw)) {
+      collected.unshift(raw.replace(lineComment, ''));
       row--;
       continue;
     }

@@ -309,7 +309,7 @@ async function parseAndExtract(
 ): Promise<ParsedResult> {
   let tree = null;
   if (extractor.grammar) {
-    tree = await pool.parse(extractor.grammar, source);
+    tree = await pool.parse(extractor.grammar, extractor.prepareSource?.(source) ?? source);
     if (!tree) {
       return { ...EMPTY_PARSE, family: familyOf(extractor.id), warning: `${relPath}: no usable parser, skipped` };
     }
